@@ -1518,7 +1518,10 @@ int serve(model::Model& m, comm::Ring& ring, Watchdog& wd, const ServeOptions& o
   // one holds ~0.25 GiB); a request that needs more evicts in the store (model.h state_reserve)
   const size_t cap = std::min(o.budget, m.state_capacity()), room = std::max<size_t>(256ull << 20, cap / 16);
   const size_t budget = cap > room ? cap - room : 0;
-  hi.max_sessions = (uint32_t)std::max<size_t>(1, budget / (64ull << 20));
+  // A disk-backed store must not advertise a RAM-only session-count cap.
+  // Token retention is independently bounded by the frontend; disk LRU remains authoritative.
+  hi.max_sessions = (uint32_t)std::min<size_t>(UINT32_MAX, std::max<size_t>(1,
+      (budget + m.state_disk_capacity()) / (64ull << 20)));
   hi.name_len = (uint32_t)o.name.size();
   Io io(o.socket, Frame(fe::kHelloEngine).add(&hi).add(o.name.data(), o.name.size()).take());
   std::printf("serve: listening on %s (context %d, session store %.2f GiB, kept between requests %.2f GiB)\n",

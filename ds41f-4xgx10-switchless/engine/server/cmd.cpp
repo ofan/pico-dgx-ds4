@@ -1,6 +1,7 @@
 // Rank 0's commands and what every rank runs alike (cmd.h).
 #include <cstdlib>
 #include "server/cmd.h"
+#include "server/snapshot_policy.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -79,9 +80,11 @@ void apply_ops(model::Model& m, const Cmd& c) {
     if (c.ops[i].op == kStCopySnaps) pin.push_back(c.ops[i].a);
   }
   if (c.handle >= 0) pin.push_back(c.handle);
+  const std::vector<int> resident = pin;
   for (const int32_t h : c.live)
     if (h > 0) pin.push_back(h);
   m.state_pin(pin);
+  spill_other_live_snapshots(m, resident, c.live);
   for (int i = 0; i < c.n_ops; ++i) apply_state(m, c.ops[i]);
 }
 
