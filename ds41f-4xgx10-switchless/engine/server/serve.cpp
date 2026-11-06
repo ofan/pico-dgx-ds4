@@ -46,6 +46,7 @@
 // whose store reused those files reads them back in (load_kept), and the front-end's session ids find
 // their sessions as before the stop.
 #include "server/serve.h"
+#include "server/snapshot_policy.h"
 
 #include <poll.h>
 #include <signal.h>
