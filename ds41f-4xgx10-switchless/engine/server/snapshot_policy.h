@@ -16,4 +16,11 @@ void spill_other_live_snapshots(Model& m, const std::vector<int>& resident, cons
   for (const auto h : live)
     if (h > 0 && std::find(resident.begin(), resident.end(), h) == resident.end()) m.state_spill(h);
 }
+// Compressed KV advances in pairs. Repeating an n-token prompt needs one fresh
+// token for sampling, so its full reusable boundary is the last even position < n.
+// CED needs 128 fresh encoder rows before a decoder replay at that boundary.
+inline int prompt_checkpoint(int n, int q, bool resume, bool ced) {
+  const int pe = (n - 1) & ~1;
+  return !resume && pe >= 128 && pe > q && (!ced || pe - q >= 128) ? pe : -1;
+}
 }  // namespace srv

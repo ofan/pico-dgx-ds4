@@ -1027,6 +1027,10 @@ class Server {
       tu.ops_ms = 1e3 * (now_s() - (resume ? t0 : f.t_start));
     }
     // ---- prefill [q, n): chunks of prefill_rows; a short remainder as one step
+    // Capture a decoder-valid checkpoint BEFORE the final 1-2 prompt tokens.
+    // Saving at n cannot serve an identical prompt (the planner caps reuse at n-1),
+    // and rounding an odd snapshot down loses the CED decoder window's first row.
+    const int pe = prompt_checkpoint(n, q, resume, ced);
     int pos = q;
     model::SampleOut first{};
     int first_row = 0;
@@ -1036,7 +1040,10 @@ class Server {
         cancelled = true;
         break;
       }
-      const int R = std::min(o_.prefill_rows, n - pos);
+      const int boundary = pe > pos ? pe : n;
+      const int R = std::min(o_.prefill_rows, boundary - pos);
+      const bool checkpoint = pos + R == pe;
+      const bool chunk_ced = ced && (pe < 0 || pos < pe);
       const bool last = pos + R == n;
       Cmd c{};
       c.slot = s;
@@ -1047,8 +1054,13 @@ class Server {
       for (int sn = (pos / o_.snap_every + 1) * o_.snap_every; sn <= pos + R; sn += o_.snap_every)
         if (sn >= 128 && c.n_snaps < kMaxSnaps && (!o_.snap_thin || keep_snap(sn, n, o_.snap_every)))
           c.snaps[c.n_snaps++] = sn;  // none that the prompt's end would thin at once
+      if (checkpoint && std::find(c.snaps, c.snaps + c.n_snaps, pe) == c.snaps + c.n_snaps) {
+        // Retain the exact boundary even if the chunk already has kMaxSnaps.
+        if (c.n_snaps == kMaxSnaps) --c.n_snaps;
+        c.snaps[c.n_snaps++] = pe;
+      }
       wd_.started = now_s();
-      if (R <= o_.small_rows && !ced) {
+      if (R <= o_.small_rows && !chunk_ced) {
         c.op = kCmdRows;
         std::copy(prompt.begin() + pos, prompt.begin() + pos + R, c.tokens);
         issue(c);
@@ -1059,11 +1071,16 @@ class Server {
         S->w = std::max(S->w, pos + R + (m_.spec() ? model::ops::kDrafts : 0));  // its draft's block keys
       } else {
         c.op = kCmdPrefill;
-        c.flags = (last ? kPfSample : 0) | (ced ? kPfCed : 0);
-        const int rest = n - pos - R;
-        c.next = rest > o_.small_rows || (ced && rest > 0) ? std::min(o_.prefill_rows, rest) : 0;
+        // Sampling at the checkpoint triggers CED's decoder replay there; its
+        // sampled token is discarded. The short exact tail samples the real tok0.
+        c.flags = (last || checkpoint ? kPfSample : 0) | (chunk_ced ? kPfCed : 0);
+        const int next_boundary = pe > pos + R ? pe : n;
+        const int rest = next_boundary - pos - R;
+        const bool next_ced = ced && (pe < 0 || pos + R < pe);
+        c.next = rest > o_.small_rows || (next_ced && rest > 0) ? std::min(o_.prefill_rows, rest) : 0;
         for (int i = 0; i < c.n_snaps; ++i)
-          if (ced && c.snaps[i] < n) S->enc_snaps.push_back(c.snaps[i]);  // the replay covers only one at n
+          if (chunk_ced && (!(last || checkpoint) || c.snaps[i] < pos + R))
+            S->enc_snaps.push_back(c.snaps[i]);  // only a sampled chunk's end has decoder rings
         issue(c);
         const uint64_t k = run_prefill(m_, c);
         if (k != ~0ull) first = m_.wait(k), first_row = 0;
@@ -1099,16 +1116,17 @@ class Server {
     tu.ops_gpu_ms = m_.mark_ms(0, 1);
     if (tu.pending) tu.add_split(m_);  // the last chunk's
     tu.tail_ms = 1e3 * (now_s() - t_first);
-    // the window snapshot at the prompt's end (a first run's): a later request that keeps the prompt but
-    // not what was generated after it (an agent dropping the reasoning, say) restarts there
-    if (!resume && n >= 128 && n % o_.snap_every != 0 && n != S->pe_snap) {
-      Cmd c{};
-      c.op = kCmdState;
-      c.slot = s;
-      if (S->pe_snap >= 0) c.ops[c.n_ops++] = {kStDropSnap, S->h, S->pe_snap, 0};
-      c.ops[c.n_ops++] = {kStSnap, S->h, n, 0};
-      S->pe_snap = n;
-      issue(c);
+    if (pe >= 0) {
+      // Already captured at pe, with valid decoder and draft windows. Never take
+      // this snapshot after the tail: that would record the wrong ring position.
+      if (S->pe_snap >= 0 && S->pe_snap != pe) {
+        Cmd c{};
+        c.op = kCmdState;
+        c.slot = s;
+        c.ops[c.n_ops++] = {kStDropSnap, S->h, S->pe_snap, 0};
+        issue(c);
+      }
+      S->pe_snap = pe;
     }
     if (stop_id(f, tok0)) return ended(f, fe::kStop);
     if ((int)f.out.size() >= (int)h.max_new_tokens) return ended(f, fe::kLength);
