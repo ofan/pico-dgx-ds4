@@ -70,3 +70,11 @@ exactly stops the rank at startup instead of serving unsteered.
 `engine/model/tests/glp_test.cpp` (host only, no GPU) checks the reader against the real GLP-39 export
 (39 directions, layers 1..39, alpha 0.75, worst |norm-1| 2.9e-8), six synthetic refusals, the env contract
 (unset = off, overrides applied and refused), `alpha 0` bit identity and the projection's orthogonality.
+
+## Native image-input backport (qualification pending)
+
+Narrow backport of parent 67e2888 onto the sampler/DSML/GLP production lineage.
+Vision is opt-in, uses the checkpoint ViT/aligner and injects image spans at prefill;
+image requests bypass text prefix/session reuse. Preserve the prompt-checkpoint/CED
+boundary repair. Parent measurements are not acceptance results for this branch.
+

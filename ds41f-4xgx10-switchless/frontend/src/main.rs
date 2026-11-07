@@ -32,6 +32,8 @@ fn usage() -> ! {
                                 conversations' text), so that the engine's kept sessions are found again
       --session-cache-tokens N   retained history token budget, default 16777216 (not active KV)
       --table-days N            sessions unused for longer are not kept: 7
+      --vision-addr HOST:PORT   accept image_url / image parts: the image encoder (tools/vision) turns
+                                them into embedding rows (docs/vision.md); without it images are refused
   dsfront admin --socket PATH <command>               one command to a server's admin socket; prints
                                                       the answer (docs/engine.md, \"Launch and stop\")
   dsfront mock-engine [options]                       a rank-0 stand-in (docs/protocol.md)
@@ -122,6 +124,7 @@ fn serve(args: &[String]) {
         protocol_error_dir: opt(args, "--protocol-error-dir").map(Into::into)
             .or_else(|| std::env::var_os("DSFRONT_PROTOCOL_ERROR_DIR").map(Into::into)),
         hold: std::time::Duration::from_secs(parse_opt(args, "--hold-s", 600u64)),
+        vision_addr: opt(args, "--vision-addr"),
     };
     let session_tokens = parse_opt(args, "--session-cache-tokens", 16usize << 20);
     if session_tokens == 0 {
