@@ -252,22 +252,23 @@ GlpFile glp_read(const std::string& path, int num_layers, int hidden) {
     if (it == md.end() || it->second.kind != kString) return nullptr;
     return &it->second.s;
   };
-  // The hook and spec this engine implements: residual_stream_post_layer, spec v1 (Owen's HOOK_VERSIONS).
+  // Exact supported spec/hook pairs, matching the reference HOOK_VERSIONS.
   if (meta_str("glp.mode") == nullptr || *meta_str("glp.mode") != "project")
     throw std::runtime_error(path + ": glp.mode is not 'project'; this runtime projects and never adds a control vector");
   auto spec = md.find("glp.spec_version");
-  if (spec == md.end() || !is_int(spec->second) || (int)spec->second.num != 1)
-    throw std::runtime_error(path + ": glp.spec_version is not 1 (spec v1, hook residual_stream_post_layer)");
+  if (spec == md.end() || !is_int(spec->second) || ((int)spec->second.num != 1 && (int)spec->second.num != 3))
+    throw std::runtime_error(path + ": glp.spec_version must be 1 or 3");
   if (auto r = md.find("glp.rank"); r != md.end() && (!is_int(r->second) || (int)r->second.num != 1))
     throw std::runtime_error(path + ": glp.rank is not 1; this reader applies rank 1");
   for (const char* key : {"glp.dir_scales", "glp.layer_scales"})
     if (md.count(key))
       throw std::runtime_error(path + ": " + key + " is not supported; this reader applies unit directions with scalar glp.alpha_default");
-  if (meta_str("glp.hook_point") == nullptr || *meta_str("glp.hook_point") != "residual_stream_post_layer")
-    throw std::runtime_error(path + ": glp.hook_point is not residual_stream_post_layer; spec v3 hooks are not applied by this runtime");
-  if (meta_str("glp.derived_at") && *meta_str("glp.derived_at") != "residual_stream_post_layer")
-    std::fprintf(stderr, "glp: warning: %s: transferred vector, derived at %s and applied at residual_stream_post_layer\n",
-                 path.c_str(), meta_str("glp.derived_at")->c_str());
+  const std::string hook = (int)spec->second.num == 3 ? "hc_fold_pre_engram" : "residual_stream_post_layer";
+  if (meta_str("glp.hook_point") == nullptr || *meta_str("glp.hook_point") != hook)
+    throw std::runtime_error(path + ": glp.hook_point disagrees with glp.spec_version; expected " + hook);
+  if (meta_str("glp.derived_at") && *meta_str("glp.derived_at") != hook)
+    std::fprintf(stderr, "glp: warning: %s: transferred vector, derived at %s and applied at %s\n",
+                 path.c_str(), meta_str("glp.derived_at")->c_str(), hook.c_str());
 
   float alpha = 0.f;
   bool have_alpha = false;
@@ -279,7 +280,7 @@ GlpFile glp_read(const std::string& path, int num_layers, int hidden) {
 
   GlpFile out;
   out.dir.assign((size_t)num_layers * hidden, 0.f);
-  out.hook = "residual_stream_post_layer";
+  out.hook = hook;
   uint64_t end = base;
   std::vector<int> layers;
   for (const Info& in : infos) {
@@ -381,6 +382,7 @@ GlpCfg glp_from_env() {
         throw std::runtime_error(std::string("WEIGHTLESS_STEER_LAYERS names layer ") + std::to_string(layer) +
                                  " without a direction in " + path);
   }
+  cfg.mean_streams = f.hook == "hc_fold_pre_engram";
   cfg.on = true;
   cfg.alpha = f.alpha;
   cfg.dir = std::move(f.dir);

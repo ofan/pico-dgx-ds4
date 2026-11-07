@@ -141,8 +141,8 @@ int main(int argc, char** argv) {
   }
   {
     Synth s;
-    s.path = "/tmp/glp_bad_spec.gguf", s.spec = 3;
-    refuses(s, "spec_version 3");
+    s.path = "/tmp/glp_bad_spec.gguf", s.spec = 2;
+    refuses(s, "spec_version 2");
     s = Synth(), s.path = "/tmp/glp_bad_hook.gguf", s.hook = "hc_fold_pre_engram";
     refuses(s, "the spec-v3 hook");
     s = Synth(), s.path = "/tmp/glp_bad_mode.gguf", s.mode = "add";
@@ -157,11 +157,10 @@ int main(int argc, char** argv) {
 
   // ---- the real export -------------------------------------------------------------------------
   GlpFile f = glp_read(argv[1], 40, 5120);
-  CHECK(f.layers.size() == 39, "layers %zu", f.layers.size());
-  CHECK(!f.layers.empty() && f.layers.front() == 1 && f.layers.back() == 39, "layers %d..%d", f.layers.front(),
-        f.layers.back());
-  CHECK(std::fabs(f.alpha - 0.75f) < 1e-6f, "alpha %g", f.alpha);
-  CHECK(f.hook == "residual_stream_post_layer", "hook %s", f.hook.c_str());
+  const bool v3 = f.hook == "hc_fold_pre_engram";
+  CHECK(f.layers.size() == (v3 ? 27 : 39), "layers %zu", f.layers.size());
+  CHECK(f.layers.front() == (v3 ? 11 : 1) && f.layers.back() == (v3 ? 37 : 39), "layer range");
+  CHECK(f.alpha == (v3 ? 3.5f : .75f), "alpha %g", f.alpha);
   double worst = 0;
   for (int L : f.layers) {
     double n = 0;
@@ -212,8 +211,8 @@ int main(int argc, char** argv) {
     const auto on = glp_from_env();
     int n = 0;
     for (int L = 0; L < 40; ++L) n += on.layer[L];
-    CHECK(on.on && n == 39 && !on.layer[0] && on.layer[1] && on.layer[39], "path: on %d, %d layers", (int)on.on, n);
-    CHECK(std::fabs(on.alpha - 0.75f) < 1e-6f, "path alpha %g", on.alpha);
+    CHECK(on.on && n == (v3 ? 27 : 39) && !on.layer[0] && on.layer[v3 ? 11 : 1] && on.layer[v3 ? 37 : 39], "path: on %d, %d layers", (int)on.on, n);
+    CHECK(on.alpha == f.alpha && on.mean_streams == v3, "path alpha %g", on.alpha);
 
     ::setenv("WEIGHTLESS_STEER_ALPHA", "0", 1);
     CHECK(glp_from_env().alpha == 0.f, "WEIGHTLESS_STEER_ALPHA=0 not applied");
@@ -223,11 +222,11 @@ int main(int argc, char** argv) {
     CHECK(threw, "a malformed WEIGHTLESS_STEER_ALPHA was accepted");
     ::unsetenv("WEIGHTLESS_STEER_ALPHA");
 
-    ::setenv("WEIGHTLESS_STEER_LAYERS", " 1 , 2 ", 1);
+    ::setenv("WEIGHTLESS_STEER_LAYERS", v3 ? "11,12" : " 1 , 2 ", 1);
     const auto few = glp_from_env();
     int m = 0;
     for (int L = 0; L < 40; ++L) m += few.layer[L];
-    CHECK(m == 2 && few.layer[1] && few.layer[2], "WEIGHTLESS_STEER_LAYERS 1,2 gave %d layers", m);
+    CHECK(m == 2 && few.layer[v3 ? 11 : 1] && few.layer[v3 ? 12 : 2], "WEIGHTLESS_STEER_LAYERS 1,2 gave %d layers", m);
     ::setenv("WEIGHTLESS_STEER_LAYERS", "1,0", 1);
     threw = false;
     try { glp_from_env(); } catch (const std::exception&) { threw = true; }

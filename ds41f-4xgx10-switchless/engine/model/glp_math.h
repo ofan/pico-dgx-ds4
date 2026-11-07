@@ -39,5 +39,9 @@ GLP_HD float glp_fold(float write, const float* res, float post, const float* co
   for (int m = 1; m < 4; ++m) v = glp_fma(comb[m * 4 + n], res[m], v);
   return v;
 }
+// Spec-v3 mean: round each FP32 addition, divide by exactly four before dot.
+GLP_HD float glp_mean4(float a, float b, float c, float d) {
+  return glp_mul(glp_add(glp_add(glp_add(a, b), c), d), 0.25f);
+}
 } }
 #undef GLP_HD

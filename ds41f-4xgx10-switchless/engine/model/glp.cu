@@ -21,6 +21,7 @@ constexpr int kPer = detail::kGlpPer;
 static_assert(kThreads * kPer == model::kDim, "Owen v1 projection layout");
 constexpr int kWarps = kThreads / 32;
 
+template <bool Mean>
 __global__ void __launch_bounds__(kThreads) k_glp_steer(uint16_t* streams, int rows, const float* __restrict__ dir,
                                                         const float* __restrict__ alpha, const float* __restrict__ pre,
                                                         uint16_t* __restrict__ yraw, const uint16_t* write,
@@ -49,13 +50,18 @@ __global__ void __launch_bounds__(kThreads) k_glp_steer(uint16_t* streams, int r
       } else {
         h[n][j] = attn::bf2f(row[(size_t)n * model::kDim + c]);
       }
-      acc[n] = __fmaf_rn(h[n][j], d[j], acc[n]);
+      if constexpr (!Mean) acc[n] = __fmaf_rn(h[n][j], d[j], acc[n]);
     }
+  }
+  if constexpr (Mean) {
+#pragma unroll
+    for (int j = 0; j < kPer; ++j)
+      acc[0] = __fmaf_rn(detail::glp_mean4(h[0][j], h[1][j], h[2][j], h[3][j]), d[j], acc[0]);
   }
   __shared__ float red[model::kHc][kWarps];
   __shared__ float scale[model::kHc];
 #pragma unroll
-  for (int n = 0; n < model::kHc; ++n) {
+  for (int n = 0; n < (Mean ? 1 : model::kHc); ++n) {
 #pragma unroll
     for (int off = 16; off; off >>= 1) acc[n] = __fadd_rn(acc[n], __shfl_xor_sync(0xffffffffu, acc[n], off));
     if (lane == 0) red[n][warp] = acc[n];
@@ -64,7 +70,7 @@ __global__ void __launch_bounds__(kThreads) k_glp_steer(uint16_t* streams, int r
   if (tid < model::kHc) {
     float tot = 0.f;
 #pragma unroll
-    for (int w = 0; w < kWarps; ++w) tot = __fadd_rn(tot, red[tid][w]);
+    for (int w = 0; w < kWarps; ++w) tot = __fadd_rn(tot, red[Mean ? 0 : tid][w]);
     scale[tid] = __fmul_rn(alpha[0], tot);  // alpha * (h . d)
   }
   __syncthreads();
@@ -88,22 +94,58 @@ __global__ void __launch_bounds__(kThreads) k_glp_steer(uint16_t* streams, int r
   }
 }
 
+// Input is the collective's rank-order FP32 sum rounded once to BF16.
+__global__ void __launch_bounds__(kThreads) k_glp_write(uint16_t* write, const float* dir, const float* alpha) {
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  uint16_t* row = write + (size_t)blockIdx.x * model::kDim;
+  float h[kPer], d[kPer], acc = 0.f;
+#pragma unroll
+  for (int j = 0; j < kPer; ++j) {
+    int c = detail::glp_column(tid, j);
+    h[j] = attn::bf2f(row[c]); d[j] = dir[c];
+    acc = __fmaf_rn(h[j], d[j], acc);
+  }
+#pragma unroll
+  for (int off = 16; off; off >>= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, off));
+  __shared__ float partial[kWarps], scale;
+  if (!lane) partial[warp] = acc;
+  __syncthreads();
+  if (!tid) {
+    float total = 0.f;
+#pragma unroll
+    for (int w = 0; w < kWarps; ++w) total = __fadd_rn(total, partial[w]);
+    scale = __fmul_rn(alpha[0], total);
+  }
+  __syncthreads();
+#pragma unroll
+  for (int j = 0; j < kPer; ++j)
+    row[detail::glp_column(tid, j)] = attn::f2bf(__fsub_rn(h[j], __fmul_rn(scale, d[j])));
+}
+
 }  // namespace
 
 void glp_steer(uint16_t* streams, int rows, const float* dir, const float* alpha, const float* pre, uint16_t* yraw,
                cudaStream_t s) {
   if (rows < 1) return;
-  k_glp_steer<<<rows, kThreads, 0, s>>>(streams, rows, dir, alpha, pre, yraw, nullptr, nullptr, nullptr, nullptr);
+  k_glp_steer<false><<<rows, kThreads, 0, s>>>(streams, rows, dir, alpha, pre, yraw, nullptr, nullptr, nullptr, nullptr);
   CUDA_CHECK(cudaGetLastError());
 }
 
 void glp_fold_steer(uint16_t* streams, int rows, const float* dir, const float* alpha,
                      const uint16_t* write, const uint16_t* residual, const float* post, const float* comb,
-                     const float* pre, uint16_t* yraw, cudaStream_t s) {
+                     const float* pre, uint16_t* yraw, cudaStream_t s, bool mean_streams) {
   if (rows < 1) return;
-  k_glp_steer<<<rows, kThreads, 0, s>>>(streams, rows, dir, alpha, pre, yraw, write, residual, post, comb);
+  if (mean_streams)
+    k_glp_steer<true><<<rows, kThreads, 0, s>>>(streams, rows, dir, alpha, pre, yraw, write, residual, post, comb);
+  else
+    k_glp_steer<false><<<rows, kThreads, 0, s>>>(streams, rows, dir, alpha, pre, yraw, write, residual, post, comb);
   CUDA_CHECK(cudaGetLastError());
 }
 
+void glp_steer_write(uint16_t* write, int rows, const float* dir, const float* alpha, cudaStream_t s) {
+  if (rows < 1) return;
+  k_glp_write<<<rows, kThreads, 0, s>>>(write, dir, alpha);
+  CUDA_CHECK(cudaGetLastError());
+}
 }  // namespace ops
 }  // namespace model

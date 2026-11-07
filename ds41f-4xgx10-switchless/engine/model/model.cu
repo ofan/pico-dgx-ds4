@@ -129,7 +129,7 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
     glp_alpha = dalloc<float>(1);
     CUDA_CHECK(cudaMemcpy(glp_dir, glp.dir.data(), sizeof(float) * glp.dir.size(), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(glp_alpha, &glp.alpha, sizeof(float), cudaMemcpyHostToDevice));
-    if (rank == 0) std::printf("glp: steering on: alpha %g, %d layers, hook residual_stream_post_layer\n", glp.alpha, n);
+    if (rank == 0) std::printf("glp: steering on: alpha %g, %d layers, hook %s\n", glp.alpha, n, glp.mean_streams ? "hc_fold_pre_engram" : "residual_stream_post_layer");
   }
   x = dalloc<bf16>((size_t)R * kHcDim);
   mid = dalloc<bf16>((size_t)R * kHcDim);
@@ -226,7 +226,7 @@ void Model::Impl::steer_layer(int L, int R, const float* pre, bf16* yraw) {
     ops::glp_steer(U(x), R, glp_dir + (size_t)L * kDim, glp_alpha, pre, yraw ? U(yraw) : nullptr, st);
   } else {
     ops::glp_fold_steer(U(x), R, glp_dir + (size_t)L * kDim, glp_alpha, U(sub), U(mid), f_post, f_comb,
-                       pre, yraw ? U(yraw) : nullptr, st);
+                       pre, yraw ? U(yraw) : nullptr, st, glp.mean_streams);
   }
 }
 
@@ -685,7 +685,16 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
   }
   l2pf(4, L, R);
   join(sa);
-  ops::allreduce_hc(ch, part, false, R, x, a_post, a_comb, a_pre, mid, yraw, dumps ? sub : nullptr, st);
+  const bool steer_write = glp.on && glp.mean_streams && glp.layer[L] && glp.alpha != 0.f;
+  ops::allreduce_hc(ch, part, false, R, x, a_post, a_comb, a_pre, mid, yraw,
+                    (dumps || steer_write) ? sub : nullptr, st);
+  if (steer_write) {
+    // Keep the collective and its rank-order sum unchanged. Only active v3 reruns the
+    // attention boundary with the projected write, before FFN mixes are computed.
+    ops::glp_steer_write(U(sub), R, glp_dir + (size_t)L * kDim, glp_alpha, st);
+    attn::hc_post(U(sub), U(x), a_post, a_comb, R, U(mid), st);
+    attn::hc_pre(U(mid), a_pre, R, nullptr, U(yraw), nullptr, st);
+  }
   if (dumps) {
     dump(sink, L, "attn_out", pos0, R, sub, kDim * 2);
     dump(sink, L, "mid", pos0, R, mid, kHcDim * 2);

@@ -1,9 +1,12 @@
-// GLP steering: spec v1, hook residual_stream_post_layer (the hook Owen's engine applies).
+// GLP steering: spec v1 residual_stream_post_layer and spec v3 hc_fold_pre_engram.
 //
 // A GLP file holds one unit direction per decoder layer. At the end of a layer, after its write has
 // been folded into the hc streams, every stream is projected off that direction:
 //     h[n] <- bf16(h[n] - alpha * (h[n] . d) * d),   n = 0 .. hc_mult - 1
-// which is what models/deepseek_v4_1/glp.py's steer_post_layer does (read_glp -> GLPSteering ->
+// Spec v3 instead projects the mean of the four folded BF16 streams, subtracts
+// that common correction from each stream, and also projects the attention write
+// before its post/pre boundary. The direction file is read unchanged, not re-exported.
+// Spec v1 is what models/deepseek_v4_1/glp.py's steer_post_layer does (read_glp -> GLPSteering ->
 // tilelang_glp.glp_project: fold the layer's write with post/comb into the row's streams, project every
 // stream, keep the result with comb the identity and post zero). Off unless WEIGHTLESS_STEER_PATH is
 // set; a file the reader cannot apply exactly is refused at startup instead of serving unsteered.
@@ -19,7 +22,7 @@ namespace model {
 namespace detail {
 
 // The file's contents, validated: unit directions by layer (index kDim * L), the layers it steers and
-// its alpha. spec_v1 only: rank-1 projective removal, one scalar alpha, hook residual_stream_post_layer.
+// its alpha. Both supported specs use rank-1 projective removal and one scalar alpha.
 struct GlpFile {
   std::vector<float> dir;     // [kLayers][kDim], zero rows for the layers the file does not steer
   std::vector<int> layers;    // the steered layers, ascending
@@ -36,6 +39,7 @@ GlpFile glp_read(const std::string& path, int num_layers, int hidden);
 // WEIGHTLESS_STEER_LAYERS). on == false when WEIGHTLESS_STEER_PATH is unset: no buffer, no kernel.
 struct GlpCfg {
   bool on = false;
+  bool mean_streams = false;  // spec v3: companion attention write + common mean-stream correction
   float alpha = 0.f;
   std::vector<float> dir;  // [kLayers][kDim]
   bool layer[kLayers] = {};
@@ -59,6 +63,8 @@ void glp_steer(uint16_t* streams, int rows, const float* dir, const float* alpha
 // BF16 with post/comb FP32; then the same projection/collapse. Buffers must not alias streams.
 void glp_fold_steer(uint16_t* streams, int rows, const float* dir, const float* alpha,
                      const uint16_t* write, const uint16_t* residual, const float* post, const float* comb,
-                     const float* pre, uint16_t* yraw, cudaStream_t s);
+                     const float* pre, uint16_t* yraw, cudaStream_t s, bool mean_streams = false);
+// Spec v3 companion: project an already rank-order-reduced, BF16 attention write in place.
+void glp_steer_write(uint16_t* write, int rows, const float* dir, const float* alpha, cudaStream_t s);
 }  // namespace ops
 }  // namespace model

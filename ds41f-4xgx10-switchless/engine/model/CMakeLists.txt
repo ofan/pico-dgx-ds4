@@ -26,3 +26,11 @@ option(DSGB10_NVTX "NVTX ranges in the model and the server, for nsys" OFF)
 if(DSGB10_NVTX)
   target_compile_definitions(dsmodel PUBLIC DSGB10_NVTX)
 endif()
+
+# Host-only spec-v3 fold/mean/companion regression, real GLP-27 file argument.
+add_executable(glp_v3_test tests/glp_v3_test.cpp glp.cpp)
+target_include_directories(glp_v3_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Synthetic-activation conformance of the actual native-v3 kernels. No model prompts.
+add_executable(glp_v3_gpu_test tests/glp_v3_gpu_test.cu glp.cu glp.cpp)
+target_include_directories(glp_v3_gpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

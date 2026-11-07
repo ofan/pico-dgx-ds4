@@ -431,6 +431,8 @@ void Model::Impl::attention_p(int L, int a, int M, const std::vector<std::pair<i
     for (int k = 0; k < kRanks; ++k)
       if (k != rank) wob(k, p.oqa + (size_t)k * Q * kOPart, p.osa + (size_t)k * Q * (kOPart / 32));
     dsk::sum4_bf16_p(p.part, (size_t)Q * kDim, (size_t)n * kDim, p.sub, st);
+    if (glp.on && glp.mean_streams && glp.layer[L] && glp.alpha != 0.f)
+      ops::glp_steer_write(U(p.sub), n, glp_dir + (size_t)L * kDim, glp_alpha, st);
     boundary_p(n, p.sub, p.x, p.a_post, p.a_comb, p.a_pre, p.mid, L, 1, p.pm, p.f_post, p.f_comb);
   }
 }
@@ -490,7 +492,7 @@ void Model::Impl::ffn_p(int L, int M) {
                      nL < 0 ? U(p.yraw) : nullptr, st);
     } else {
       ops::glp_fold_steer(U(p.x), n, glp_dir + (size_t)L * kDim, glp_alpha, U(p.sub), U(p.mid),
-                          p.f_post, p.f_comb, nL < 0 ? p.pm : nullptr, nL < 0 ? U(p.yraw) : nullptr, st);
+                          p.f_post, p.f_comb, nL < 0 ? p.pm : nullptr, nL < 0 ? U(p.yraw) : nullptr, st, glp.mean_streams);
     }
     if (nL >= 0) boundary_p(n, nullptr, p.x, nullptr, nullptr, p.pm, nullptr, nL, 0, p.a_pre, p.a_post, p.a_comb);
   } else {
