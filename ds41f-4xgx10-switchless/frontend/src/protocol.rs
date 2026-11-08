@@ -4,10 +4,10 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const DEFAULT_SOCKET: &str = "/tmp/dsgb10-engine.sock";
 /// Larger frames are a protocol error (a 1M-token prompt is 4 MB).
-pub const MAX_FRAME: usize = 64 << 20;
+pub const MAX_FRAME: usize = 192 << 20;
 
 pub const T_HELLO: u16 = 0x01;
 pub const T_SUBMIT: u16 = 0x02;
@@ -236,8 +236,39 @@ impl Frame {
                 let n_stop = r.u32()? as usize;
                 let n_prompt = r.u32()? as usize;
                 r.u32()?;
+                if n_prompt > 1048576 || n_stop > 16 || flags & !(FLAG_SEED | FLAG_KEEP | FLAG_LOGPROBS | FLAG_IMAGES) != 0 {
+                    return Err("invalid SUBMIT limits/flags".into());
+                }
                 let stop_ids = r.u32s(n_stop)?;
                 let prompt = r.u32s(n_prompt)?;
+                let images = if flags & FLAG_IMAGES != 0 {
+                    if base_session_id != 0 || prefix_hint != 0 || flags & FLAG_KEEP != 0 {
+                        return Err("image histories must be uncached".into());
+                    }
+                    let start = r.i;
+                    let n = r.u32()? as usize;
+                    if !(1..=16).contains(&n) { return Err("invalid image count".into()); }
+                    let mut end = 0usize;
+                    let mut rows_total = 0usize;
+                    for _ in 0..n {
+                        let pos = r.u32()? as usize;
+                        let rows = r.u32()? as usize;
+                        r.u64()?;
+                        if !(3..=1024).contains(&rows) || pos < end || pos + rows > prompt.len() {
+                            return Err("invalid image span".into());
+                        }
+                        if !prompt[pos..pos + rows].iter().all(|&id| id == crate::vision::IMAGE_TOKEN_ID) {
+                            return Err("image span placeholder mismatch".into());
+                        }
+                        end = pos + rows;
+                        rows_total += rows;
+                    }
+                    let data = r.bytes(rows_total * crate::vision::IMAGE_DIM * 2)?;
+                    if data.chunks_exact(2).any(|b| u16::from_le_bytes([b[0],b[1]]) & 0x7f80 == 0x7f80) {
+                        return Err("nonfinite image embedding".into());
+                    }
+                    Some(p[start..r.i].to_vec())
+                } else { None };
                 Frame::Submit(Submit {
                     req_id,
                     session_id,
@@ -252,7 +283,7 @@ impl Frame {
                     prefix_hint,
                     stop_ids,
                     prompt,
-                    images: None,
+                    images,
                 })
             }
             T_CANCEL => Frame::Cancel { req_id: r.u64()? },
@@ -355,6 +386,41 @@ pub async fn read_frame<Rd: AsyncRead + Unpin>(rd: &mut Rd) -> std::io::Result<O
 mod tests {
     use super::*;
 
+    fn image_submit() -> Submit {
+        let e = crate::vision::Encoded { rows: vec![3], hashes: vec![1], data: vec![0; 3 * 5120 * 2], ms: 0.0 };
+        Submit { req_id: 1, session_id: 1 << 63, base_session_id: 0, seed: 0, temperature: 0.0,
+            top_p: 1.0, top_k: 0, max_new_tokens: 2, flags: FLAG_IMAGES, n_top_logprobs: 0,
+            prefix_hint: 0, stop_ids: vec![], prompt: vec![5,129264,129264,129264,6],
+            images: Some(crate::vision::payload(&[1], &e)) }
+    }
+    fn dec(s: Submit) -> Result<Frame, String> {
+        let b = Frame::Submit(s).encode(); Frame::decode(T_SUBMIT, &b[8..], |_| 0)
+    }
+    #[test]
+    fn images_roundtrip() { let s = image_submit(); assert_eq!(dec(s.clone()).unwrap(), Frame::Submit(s)); }
+    #[test]
+    fn images_cannot_use_text_cache() {
+        let mut s = image_submit(); s.flags |= FLAG_KEEP; assert!(dec(s).is_err());
+        let mut s = image_submit(); s.prefix_hint = 1; assert!(dec(s).is_err());
+        let mut s = image_submit(); s.base_session_id = 7; assert!(dec(s).is_err());
+    }
+    #[test]
+    fn images_validate_exact_rows_and_finite() {
+        let mut s = image_submit(); s.images.as_mut().unwrap().pop(); assert!(dec(s).is_err());
+        let mut s = image_submit(); s.images.as_mut().unwrap().extend_from_slice(&[0]); assert!(dec(s).is_err());
+        let mut s = image_submit(); s.images.as_mut().unwrap()[20..22].copy_from_slice(&0x7fc0u16.to_le_bytes()); assert!(dec(s).is_err());
+        let mut s = image_submit(); s.prompt[2] = 1; assert!(dec(s).is_err());
+    }
+    #[test]
+    fn images_validate_count_and_span_bounds() {
+        for count in [0u32,17,u32::MAX] {
+            let mut s = image_submit(); s.images.as_mut().unwrap()[..4].copy_from_slice(&count.to_le_bytes()); assert!(dec(s).is_err());
+        }
+        for rows in [0u32,1,1025,u32::MAX] {
+            let mut s = image_submit(); s.images.as_mut().unwrap()[8..12].copy_from_slice(&rows.to_le_bytes()); assert!(dec(s).is_err());
+        }
+        let mut s = image_submit(); s.images.as_mut().unwrap()[4..8].copy_from_slice(&u32::MAX.to_le_bytes()); assert!(dec(s).is_err());
+    }
     #[test]
     fn roundtrip_and_layout() {
         let s = Submit {

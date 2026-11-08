@@ -62,6 +62,7 @@ pub struct App {
     sessions: Mutex<SessionTable>,
     think_end_id: Option<u32>,
     counter: AtomicU64,
+    image_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl App {
@@ -75,7 +76,7 @@ impl App {
         eprintln!("session table: retained-token budget {session_tokens}, sessions 256");
         let think_end_id = tok.token_id("</think>");
         let gate = Gate::new(cfg.hold);
-        Arc::new(App { cfg, tok, engine, gate, sessions: Mutex::new(SessionTable::new(256, session_tokens)), think_end_id, counter: AtomicU64::new(0) })
+        Arc::new(App { cfg, tok, engine, gate, sessions: Mutex::new(SessionTable::new(256, session_tokens)), think_end_id, counter: AtomicU64::new(0), image_slots: Arc::new(tokio::sync::Semaphore::new(16)) })
     }
 
     /// The session table an earlier run saved (session.rs `load`), for the next turns of its
@@ -534,6 +535,7 @@ struct Gen {
     app: Arc<App>,
     /// counts the request in flight at the gate until it ends (or its client goes away)
     _pass: Pass,
+    _image_pass: Option<tokio::sync::OwnedSemaphorePermit>,
     req_id: u64,
     session_id: u64,
     prompt_text: String,
@@ -775,6 +777,7 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
     Ok(Gen {
         app: app.clone(),
         _pass: pass,
+        _image_pass: None,
         req_id,
         session_id: plan.session_id,
         prompt_text: p.prompt.clone(),
@@ -803,6 +806,7 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
     let Some(addr) = app.cfg.vision_addr.clone() else {
         return Err(bad("image, audio and video input are not supported".into()));
     };
+    let image_pass = app.image_slots.clone().try_acquire_owned().map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), "image request queue full".into()))?;
     let enc = crate::vision::encode(&addr, &p.images, Duration::from_secs(90)).await.map_err(|e| {
         if e.starts_with("cannot read") { bad(e) } else { ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e) }
     })?;
@@ -850,6 +854,7 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
     Ok(Gen {
         app: app.clone(),
         _pass: pass,
+        _image_pass: Some(image_pass),
         req_id,
         session_id,
         prompt_text: p.prompt.clone(),

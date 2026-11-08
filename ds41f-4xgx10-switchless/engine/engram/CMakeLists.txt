@@ -10,3 +10,7 @@ foreach(tool hashcheck iobench rowcheck storecheck gathercheck cachesim e2e pack
   add_executable(engram_${tool} tools/${tool}.cpp)
   target_link_libraries(engram_${tool} PRIVATE engram)
 endforeach()
+
+# Host-only negative image ID / publisher live-mask equivalence.
+add_executable(vision_hash_test tools/vision_hash_test.cpp)
+target_link_libraries(vision_hash_test PRIVATE engram)

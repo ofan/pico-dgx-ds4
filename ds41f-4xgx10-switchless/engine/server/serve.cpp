@@ -264,6 +264,8 @@ class Io {
       Request& r = e.rq;
       if (p.size() < sizeof r.h) return false;
       std::memcpy(&r.h, p.data(), sizeof r.h);
+      if (r.h.n_prompt > 1048576 || r.h.n_stop_ids > kMaxStop ||
+          (r.h.flags & ~(fe::kFlagSeed | fe::kFlagKeep | fe::kFlagLogprobs | fe::kFlagImages))) return false;
       const size_t base = sizeof r.h + 4 * (size_t(r.h.n_stop_ids) + r.h.n_prompt);
       if (!(r.h.flags & fe::kFlagImages) ? p.size() != base : p.size() < base + 4) return false;
       r.stop.resize(r.h.n_stop_ids);
@@ -274,15 +276,22 @@ class Io {
       if (r.h.flags & fe::kFlagImages) {  // vision: n, the spans, their rows
         uint32_t ni = 0;
         std::memcpy(&ni, p.data() + base, 4);
-        if (ni < 1 || ni > 64 || p.size() < base + 4 + ni * sizeof(fe::ImageSpan)) return false;
+        if (ni < 1 || ni > 16 || p.size() < base + 4 + ni * sizeof(fe::ImageSpan)) return false;
         r.spans.resize(ni);
         std::memcpy(r.spans.data(), p.data() + base + 4, ni * sizeof(fe::ImageSpan));
         size_t rows = 0;
-        for (const auto& s : r.spans) rows += s.rows;
+        size_t end = 0;
+        for (const auto& s : r.spans) {
+          if (s.rows < 3 || s.rows > 1024 || s.start < end || (size_t)s.start + s.rows > r.h.n_prompt) return false;
+          rows += s.rows;
+          end = (size_t)s.start + s.rows;
+        }
+        if (r.h.base_session_id || r.h.prefix_hint || (r.h.flags & fe::kFlagKeep)) return false;
         const size_t off = base + 4 + ni * sizeof(fe::ImageSpan);
         if (p.size() != off + rows * fe::kImageDim * 2) return false;
         r.img.resize(rows * fe::kImageDim);
         std::memcpy(r.img.data(), p.data() + off, r.img.size() * 2);
+        for (uint16_t x : r.img) if ((x & 0x7f80u) == 0x7f80u) return false;  // finite BF16 only
       }
       r.conn = c;
       r.t_recv = now_s();
@@ -892,7 +901,7 @@ class Server {
       if (err.empty() && (t < 0 || t >= model::kVocab)) err = "token id out of range";
     for (size_t i = 0, end = 0; err.empty() && i < f.rq.spans.size(); ++i) {  // vision: spans in order, all image ids
       const fe::ImageSpan& s = f.rq.spans[i];
-      if (s.rows < 3 || s.start < end || (size_t)s.start + s.rows >= (size_t)n) err = "bad image span";
+      if (s.rows < 3 || s.rows > 1024 || s.start < end || (size_t)s.start + s.rows >= (size_t)n) err = "bad image span";
       for (uint32_t k = 0; err.empty() && k < s.rows; ++k)
         if ((uint32_t)f.rq.prompt[s.start + k] != fe::kImageTokenId) err = "image span over a text token";
       end = (size_t)s.start + s.rows;

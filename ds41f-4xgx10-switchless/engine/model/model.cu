@@ -1087,7 +1087,13 @@ void Model::set_images(int n, const int32_t* lo, const int32_t* hi, const uint16
     if (hi[i] <= lo[i] || lo[i] < 0 || (i && lo[i] < hi[i - 1])) die("model: image span %d [%d, %d)", i, lo[i], hi[i]);
     I.img_span.emplace_back(lo[i], hi[i]), I.img_row0.push_back(total), total += hi[i] - lo[i];
   }
-  if (!n) return;
+  if (!n) {
+    I.drain();  // no consumer may retain a pointer to the request's image rows
+    if (I.img_rows) CUDA_CHECK(cudaFreeHost(I.img_rows));
+    I.img_rows = nullptr;
+    I.img_cap = 0;
+    return;
+  }
   if (total > I.img_cap) {
     I.drain();  // a chunk in flight may still read the old buffer
     if (I.img_rows) CUDA_CHECK(cudaFreeHost(I.img_rows));

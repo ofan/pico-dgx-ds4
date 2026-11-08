@@ -28,23 +28,26 @@ pub struct Encoded {
 }
 
 pub async fn encode(addr: &str, records: &[Value], timeout: Duration) -> Result<Encoded, String> {
-    if records.len() > MAX_IMAGES {
+    if records.is_empty() || records.len() > MAX_IMAGES {
         return Err(format!("at most {MAX_IMAGES} images per request"));
     }
     let t0 = Instant::now();
     let fut = async {
         let mut s = TcpStream::connect(addr).await.map_err(|e| format!("the image encoder is not reachable: {e}"))?;
         let body = json!({ "images": records }).to_string().into_bytes();
+        if body.len() > (64 << 20) { return Err("image request too large".into()); }
         s.write_all(&(body.len() as u32).to_le_bytes()).await.map_err(|e| e.to_string())?;
         s.write_all(&body).await.map_err(|e| e.to_string())?;
         let mut n4 = [0u8; 4];
         s.read_exact(&mut n4).await.map_err(|e| format!("image encoder: {e}"))?;
-        let mut h = vec![0u8; u32::from_le_bytes(n4) as usize];
+        let header_len = u32::from_le_bytes(n4) as usize;
+        if header_len > (64 << 10) { return Err("image encoder: header too large".into()); }
+        let mut h = vec![0u8; header_len];
         s.read_exact(&mut h).await.map_err(|e| format!("image encoder: {e}"))?;
         let mut n8 = [0u8; 8];
         s.read_exact(&mut n8).await.map_err(|e| format!("image encoder: {e}"))?;
         let n = u64::from_le_bytes(n8) as usize;
-        if n > (MAX_IMAGES * 1100 * IMAGE_DIM * 2) {
+        if n > (MAX_IMAGES * 1024 * IMAGE_DIM * 2) {
             return Err("image encoder: reply too large".to_string());
         }
         let mut data = vec![0u8; n];
@@ -65,7 +68,7 @@ pub async fn encode(addr: &str, records: &[Value], timeout: Duration) -> Result<
     let mut hashes = Vec::new();
     for i in imgs {
         let r = i.get("rows").and_then(Value::as_u64).ok_or("image encoder: rows")?;
-        if !(3..=1100).contains(&r) {
+        if !(3..=1024).contains(&r) {
             return Err("image encoder: bad span".into());
         }
         rows.push(r as u32);
@@ -80,6 +83,9 @@ pub async fn encode(addr: &str, records: &[Value], timeout: Duration) -> Result<
 
 /// The prompt's ids with each placeholder expanded into its image's span, and the spans' starts.
 pub fn expand(ids: &[u32], rows: &[u32]) -> Result<(Vec<u32>, Vec<u32>), String> {
+    if rows.iter().any(|&r| !(3..=1024).contains(&r)) || rows.len() > MAX_IMAGES {
+        return Err("invalid image span size/count".into());
+    }
     let n = ids.iter().filter(|&&t| t == IMAGE_TOKEN_ID).count();
     if n != rows.len() {
         return Err(format!("the prompt has {n} image placeholders for {} images", rows.len()));
@@ -117,6 +123,13 @@ pub fn payload(starts: &[u32], e: &Encoded) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn bounded_spans() {
+        for rows in [0, 1, 2, 1025, u32::MAX] { assert!(expand(&[IMAGE_TOKEN_ID], &[rows]).is_err()); }
+        assert!(expand(&vec![IMAGE_TOKEN_ID;17], &vec![3;17]).is_err());
+        let (ids, starts) = expand(&[1, IMAGE_TOKEN_ID, 2], &[1024]).unwrap();
+        assert_eq!(ids.len(),1026); assert_eq!(starts,vec![1]);
+    }
     #[test]
     fn expands_placeholders() {
         let (ids, st) = expand(&[0, 5, IMAGE_TOKEN_ID, 6, IMAGE_TOKEN_ID], &[3, 4]).unwrap();

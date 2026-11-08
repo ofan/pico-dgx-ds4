@@ -7,7 +7,7 @@
 
 namespace fe {
 
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
 constexpr const char* kDefaultSocket = "/tmp/dsgb10-engine.sock";
 
 enum MsgType : uint16_t {
