@@ -236,7 +236,7 @@ impl Frame {
                 let n_stop = r.u32()? as usize;
                 let n_prompt = r.u32()? as usize;
                 r.u32()?;
-                if n_prompt > 1048576 || n_stop > 16 || flags & !(FLAG_SEED | FLAG_KEEP | FLAG_LOGPROBS | FLAG_IMAGES) != 0 {
+                if n_prompt > 1048576 || n_stop > 32 || flags & !(FLAG_SEED | FLAG_KEEP | FLAG_LOGPROBS | FLAG_IMAGES) != 0 {
                     return Err("invalid SUBMIT limits/flags".into());
                 }
                 let stop_ids = r.u32s(n_stop)?;
