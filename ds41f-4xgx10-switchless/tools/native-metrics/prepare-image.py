@@ -19,6 +19,9 @@ for src,name,key in [(a.engine,'dsgb10_rank','engine_sha256'),(a.frontend,'dsfro
     profile[key]=hashlib.sha256(src.read_bytes()).hexdigest()
 profile['adoption']={'status':'UNQUALIFIED native telemetry trial','production_swapped':False}
 profile['production_note']='Not deployed; requires independent review and full TP4 GPU qualification'
+profile['build_policy']='Off-Spark ARM64 cross-build only; no native serving-host fallback'
+profile['build_method']='Full ARM64 engine CUDA13 cross-build and locked offline Rust frontend cross-build; inherited pinned runtime/model/vision assets'
+profile['baseline_source_commit']=profile.get('patched_source_commit',profile.get('source_commit'))
 profile['rollback']={'image':a.base_image,'authorization':'Separate coordinated restart authorization required; image rollback does not recover sessions'}
 profile['telemetry']={'schema':1,'source_revision':a.source_revision,'base_image':a.base_image,
     'rank_port':9108,'frontend_port':9109,'qualification':'UNQUALIFIED; TP4 GPU gates pending',
