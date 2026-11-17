@@ -1,3 +1,4 @@
+#include "common/telemetry.h"
 // Rank 0 as a server (serve.h, docs/protocol.md).
 //
 // Threads: the reader takes the front-end's frames (a new connection replaces the old one, whose
@@ -132,6 +133,8 @@ struct Conn {
 using ConnP = std::shared_ptr<Conn>;
 
 struct Request {
+  mutable pico::metrics::RequestMetrics metrics;
+
   ConnP conn;
   fe::SubmitHeader h{};
   std::vector<int32_t> stop, prompt;
@@ -240,6 +243,9 @@ class Io {
   void push(Event&& e) {
     {
       std::lock_guard<std::mutex> l(mu_);
+      if (!e.release) {
+        e.rq.metrics.receive(pico::metrics::steady_us());
+      }
       ev_.push_back(std::move(e));
     }
     cv_.notify_one();
@@ -478,6 +484,7 @@ class Server {
   // one is there), then the front-end's frames, then a run of the requests decoding (run).
   void loop() {
     while (!g_stop) {
+      pico::metrics::progress(pico::metrics::Scheduler);
       sweep();
       Event e;
       if (!ready_.empty()) {
@@ -494,11 +501,15 @@ class Server {
           else release(e.session);
         } else if (!e.rq.conn->dead) {  // a gone front-end's requests need no answer
           admit(std::move(e.rq));
+        } else {
+          // Disconnected before admission: terminal cancellation, no wire response.
+          e.rq.metrics.finish(3, pico::metrics::steady_us());
         }
       } else if (!rot_.empty()) {
         run();
       }
     }
+    pico::metrics::set(pico::metrics::registry.initialization, 2);
     // the stop ends what is paused or held with an error (Io::stopping): "the server is stopping"
     sweep();
     for (std::deque<Request>* d : {&ready_, &held_, &wait_}) {
@@ -838,6 +849,7 @@ class Server {
   }
 
   void tokens(const Request& rq, const model::SampleOut& o, int row) {
+    rq.metrics.token(pico::metrics::steady_us());
     const bool lp = rq.h.flags & fe::kFlagLogprobs;
     const int nt = lp ? std::min<int>({(int)rq.h.n_top_logprobs, model::ops::kTopLogprobs, o.n_top}) : 0;
     const fe::TokensHeader t{rq.h.req_id, 1, (lp ? fe::kTokLogprobs : 0u) | (nt ? fe::kTokTop : 0u)};
@@ -857,6 +869,9 @@ class Server {
     // cut short by the server's stop, an answer is an error to its client, not a finished one
     if (reason == fe::kCancelled && Io::stopping(rq)) reason = fe::kError, err = "the server is stopping";
     const double t_end = now_s();
+    const size_t metric_outcome = reason == fe::kStop ? 0 : reason == fe::kLength ? 1 :
+        reason == fe::kContext ? 2 : reason == fe::kCancelled ? 3 : reason == fe::kError ? 4 : 5;
+    rq.metrics.finish(metric_outcome, pico::metrics::steady_us());
     if (t_first <= 0) t_first = t_end;
     fe::DoneHeader d{};
     d.req_id = rq.h.req_id;
@@ -910,6 +925,7 @@ class Server {
       done(f.rq, err.empty() ? fe::kCancelled : fe::kError, 0, 0, f.t_start, 0, err);
       return Io::forget(f.rq);
     }
+    f.rq.metrics.start(pico::metrics::steady_us());
     f.sp.temperature = h.temperature;
     f.sp.top_p = h.top_p;
     f.sp.top_k = (int32_t)std::min<uint32_t>(h.top_k, 1u << 30);
@@ -969,6 +985,8 @@ class Server {
     const int q = pl.q;
     NVTX_RANGE("req %llu new %d ctx %d %s", (unsigned long long)h.req_id, n - q, n, kHow[pl.how]);
     if (!resume) {
+      pico::metrics::add(pico::metrics::registry.prompt, n);
+      pico::metrics::add(pico::metrics::registry.reused, q);
       f.q = q, f.pl = pl;
       // where the state came from, for the log (counts only), and why a start is cold: no base named
       // (the front-end found no session to continue), a session or base this engine does not hold (lost
@@ -1132,6 +1150,8 @@ class Server {
       wd_.started = 0;
       S->hist.insert(S->hist.end(), prompt.begin() + pos, prompt.begin() + pos + R);
       pos += R;
+      pico::metrics::add(pico::metrics::registry.prefilled, R);
+      pico::metrics::progress(pico::metrics::Prefill);
     }
     if (!f.rq.spans.empty()) {  // vision: the spans are for this prompt's chunks only
       Cmd c{};

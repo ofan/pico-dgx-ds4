@@ -7,6 +7,8 @@
 //! `release` once the ring is back lets them through as soon as the engine is connected again. A
 //! request in flight is never cut: the hold waits for it.
 
+use crate::metrics::M;
+use std::sync::atomic::Ordering::Relaxed;
 use crate::engine::EngineClient;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::PathBuf;
@@ -47,6 +49,7 @@ impl Drop for Pass {
     fn drop(&mut self) {
         let mut s = self.gate.st.lock().unwrap();
         s.in_flight -= 1;
+        M.running.store(s.in_flight as u64, Relaxed);
         s.last = Instant::now();
     }
 }
@@ -63,6 +66,7 @@ impl Drop for Waiting {
             // a request that waited and left (refused, or its client gone) was activity too
             let mut s = self.gate.st.lock().unwrap();
             s.waiting -= 1;
+            M.waiting.store(s.waiting as u64, Relaxed);
             s.last = Instant::now();
         }
     }
@@ -111,6 +115,9 @@ impl Gate {
                         s.waiting -= 1;
                         s.passed += 1;
                     }
+                    M.running.store(s.in_flight as u64, Relaxed);
+                    M.waiting.store(s.waiting as u64, Relaxed);
+                    M.queue.observe(t0.elapsed());
                     return Ok(Pass { gate: self.clone() });
                 }
                 if t0.elapsed() >= self.hold {
@@ -122,6 +129,7 @@ impl Gate {
                     // engine came back let the ring be lent again at once
                     w.counted = true;
                     s.waiting += 1;
+                    M.waiting.store(s.waiting as u64, Relaxed);
                     s.last = Instant::now();
                 }
             }
@@ -139,6 +147,7 @@ impl Gate {
             return Err(format!("busy: in_flight {} waiting {} idle_s {}", s.in_flight, s.waiting, s.last.elapsed().as_secs()));
         }
         s.held = Some(Instant::now());
+        M.admission.store(0, Relaxed);
         eprintln!("gate: holding requests (the ring is lent; no request for {} s)", s.last.elapsed().as_secs());
         Ok(())
     }
@@ -146,6 +155,7 @@ impl Gate {
     pub fn release(&self) {
         let mut s = self.st.lock().unwrap();
         if let Some(t) = s.held.take() {
+            M.admission.store((!s.closing) as u64, Relaxed);
             eprintln!("gate: released after {} s; {} requests waiting", t.elapsed().as_secs(), s.waiting);
         }
     }
@@ -153,6 +163,7 @@ impl Gate {
     /// Shutting down: waiting and new requests are answered at once.
     pub fn close(&self) {
         self.st.lock().unwrap().closing = true;
+        M.admission.store(0, Relaxed);
     }
 
     pub fn status(&self, connected: bool) -> String {

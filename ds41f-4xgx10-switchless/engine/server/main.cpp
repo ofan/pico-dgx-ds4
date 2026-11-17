@@ -129,6 +129,7 @@
 #include "server/cmd.h"
 #include "server/golden.h"
 #include "server/serve.h"
+#include "server/metrics.h"
 #include "weights/loader.h"
 
 namespace {
@@ -285,6 +286,9 @@ struct Args {
   float temp = 0.f, top_p = 1.f;
   int top_k = 0;
   uint32_t seed = 1;
+  std::string metrics_listen; // opt-in: explicit address, normally 127.0.0.1:9108
+  std::string metrics_model = "deepseek-v4.1-flash";
+  int metrics_cpu = -1;
   std::string socket = "/tmp/dsgb10-engine.sock";
   double session_gib = 12, session_margin_gib = 2;
   double disk_gib = 32;  // serve: the store's disk tier (0: none)
@@ -373,6 +377,9 @@ Args parse(int argc, char** argv) {
     else if (s == "--prefill-rows") a.prefill_rows = std::atoi(val().c_str());
     else if (s == "--top-p") a.top_p = std::atof(val().c_str());
     else if (s == "--top-k") a.top_k = std::atoi(val().c_str());
+    else if (s == "--metrics-listen") a.metrics_listen = val();
+    else if (s == "--metrics-model-name") a.metrics_model = val();
+    else if (s == "--metrics-cpu") a.metrics_cpu = std::stoi(val());
     else if (s == "--socket") a.socket = val();
     else if (s == "--session-gib") a.session_gib = std::atof(val().c_str());
     else if (s == "--session-margin-gib") a.session_margin_gib = std::atof(val().c_str());
@@ -565,6 +572,7 @@ void mem_report(int rank, const char* when) {
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IOLBF, 0);
   const Args a = parse(argc, argv);
+  pico::metrics::Endpoint telemetry(a.metrics_listen, a.metrics_model, a.rank, a.metrics_cpu);
   const double t0 = now_s();
   std::printf("rank %d (%s): the fleet file %s; weights %s", a.rank, comm::fleet(a.fleet).rank[a.rank].name.c_str(),
               comm::fleet(a.fleet).file.c_str(), a.weights.c_str());
@@ -727,12 +735,18 @@ int main(int argc, char** argv) {
     }
   }
   ring.barrier();
+  pico::metrics::set(pico::metrics::registry.initialization, 1);
+  pico::metrics::set(pico::metrics::registry.slots_capacity, m.slots());
+  uint64_t metrics_context = 0;
+  for (int slot = 0; slot < m.slots(); ++slot) metrics_context += m.slot_ctx(slot);
+  pico::metrics::set(pico::metrics::registry.context_capacity, metrics_context);
   pin_self(15);
   mem_report(a.rank, ("ready after " + std::to_string((int)(now_s() - t0)) + " s").c_str());
 
   Watchdog wd(a.step_timeout_s, ring);
   if (a.rank != 0) {  // follow rank 0
     follow(m, ring, wd, a.rank);
+    pico::metrics::set(pico::metrics::registry.initialization, 2);
     mem_report(a.rank, "done");
     return 0;
   }
@@ -759,6 +773,7 @@ int main(int argc, char** argv) {
     so.profile_from_req = a.profile_from_req;
     std::copy(a.spec_row_ms, a.spec_row_ms + model::ops::kDrafts + 1, so.spec_row_ms);
     const int rc = serve(m, ring, wd, so);
+    pico::metrics::set(pico::metrics::registry.initialization, 2);
     mem_report(a.rank, "stopped");
     return rc;
   }

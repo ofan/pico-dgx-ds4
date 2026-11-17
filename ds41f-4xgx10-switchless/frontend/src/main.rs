@@ -10,6 +10,7 @@ fn usage() -> ! {
   dsfront serve [options]                             the OpenAI-compatible server
       --listen ADDR             127.0.0.1:18890; repeat it for more (loopback or specific addresses;
                                 never 0.0.0.0 or ::)
+      --metrics-listen ADDR     opt-in independent telemetry (e.g. 127.0.0.1:9109)
       --engine-socket PATH      /tmp/dsgb10-engine.sock
       --api-key-file PATH       require this bearer key (the file's content, trimmed)
       --model-name NAME         deepseek-v4.1-flash-uncensored
@@ -126,6 +127,12 @@ fn serve(args: &[String]) {
         hold: std::time::Duration::from_secs(parse_opt(args, "--hold-s", 600u64)),
         vision_addr: opt(args, "--vision-addr"),
     };
+    let _metrics = opt(args, "--metrics-listen").map(|a| {
+        let addr = a.parse().unwrap_or_else(|_| { eprintln!("invalid metrics address"); std::process::exit(2) });
+        dsfront::metrics::Endpoint::start(addr, cfg.model_name.clone()).unwrap_or_else(|e| {
+            eprintln!("metrics: {e}"); std::process::exit(1)
+        })
+    });
     let session_tokens = parse_opt(args, "--session-cache-tokens", 16usize << 20);
     if session_tokens == 0 {
         eprintln!("--session-cache-tokens must be positive");
@@ -160,6 +167,7 @@ fn serve(args: &[String]) {
                 std::process::exit(1)
             }));
         }
+        dsfront::metrics::M.initialization.store(1, std::sync::atomic::Ordering::Relaxed);
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let gate = app.gate.clone();
         tokio::spawn(async move {
@@ -168,6 +176,7 @@ fn serve(args: &[String]) {
                 _ = tokio::signal::ctrl_c() => {}
                 _ = term.recv() => {}
             }
+            dsfront::metrics::M.initialization.store(2, std::sync::atomic::Ordering::Relaxed);
             eprintln!("shutting down");
             gate.close(); // requests waiting at the gate are answered now, not at the hold limit
             let _ = stop_tx.send(true);

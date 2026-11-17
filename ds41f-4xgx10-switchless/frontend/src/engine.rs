@@ -1,6 +1,7 @@
 //! Client side of the rank-0 socket: one connection, many requests multiplexed by req_id.
 //! Reconnects with backoff; requests in flight when the connection drops end with an error.
 
+use crate::metrics::M;
 use crate::protocol::{read_frame, Done, DoneReason, Frame, HelloEngine, Submit, Tokens, VERSION};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -68,8 +69,10 @@ impl EngineClient {
         let mut c = self.inner.conn.lock().unwrap();
         let wtx = c.tx.clone().ok_or("engine not connected")?;
         c.pending.insert(s.req_id, Pending { tx, n_top: if s.flags & crate::protocol::FLAG_LOGPROBS != 0 { s.n_top_logprobs } else { 0 } });
+        M.pending.store(c.pending.len() as u64, Ordering::Relaxed);
         if wtx.send(Frame::Submit(s.clone()).encode()).is_err() {
             c.pending.remove(&s.req_id);
+            M.pending.store(c.pending.len() as u64, Ordering::Relaxed);
             return Err("engine not connected".into());
         }
         Ok((s.req_id, rx))
@@ -102,13 +105,17 @@ async fn run(inner: Arc<Inner>) {
                     Ok(()) => eprintln!("engine: connection closed"),
                     Err(e) => eprintln!("engine: connection lost: {e}"),
                 }
+                M.connected.store(0, Ordering::Relaxed);
+                M.connection_errors.fetch_add(1, Ordering::Relaxed);
                 inner.info.send_replace(None);
                 let pending = {
                     let mut c = inner.conn.lock().unwrap();
                     c.tx = None;
+                    M.pending.store(0, Ordering::Relaxed);
                     std::mem::take(&mut c.pending)
                 };
                 for (req_id, p) in pending {
+                    M.engine_done[4].fetch_add(1, Ordering::Relaxed);
                     let _ = p.tx.send(Event::Done(Done {
                         req_id,
                         reason: DoneReason::Error,
@@ -123,6 +130,7 @@ async fn run(inner: Arc<Inner>) {
                 }
             }
             Err(e) => {
+                M.connection_errors.fetch_add(1, Ordering::Relaxed);
                 if !logged_down {
                     eprintln!("engine: cannot connect to {}: {e}; retrying", inner.path.display());
                     logged_down = true;
@@ -157,6 +165,7 @@ async fn connection(inner: &Arc<Inner>, stream: UnixStream) -> Result<(), String
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     inner.conn.lock().unwrap().tx = Some(tx);
     inner.info.send_replace(Some(hello));
+    M.connected.store(1, Ordering::Relaxed);
     let writer = tokio::spawn(async move {
         while let Some(b) = rx.recv().await {
             if wr.write_all(&b).await.is_err() {
@@ -176,14 +185,23 @@ async fn connection(inner: &Arc<Inner>, stream: UnixStream) -> Result<(), String
         };
         match frame {
             Ok(Frame::Tokens(t)) => {
+                M.generation_tokens.fetch_add(t.ids.len() as u64, Ordering::Relaxed);
                 let c = inner.conn.lock().unwrap();
                 if let Some(p) = c.pending.get(&t.req_id) {
                     let _ = p.tx.send(Event::Tokens(t));
                 }
             }
             Ok(Frame::Done(d)) => {
-                let p = inner.conn.lock().unwrap().pending.remove(&d.req_id);
+                let p = {
+                    let mut c = inner.conn.lock().unwrap();
+                    let p = c.pending.remove(&d.req_id);
+                    M.pending.store(c.pending.len() as u64, Ordering::Relaxed);
+                    p
+                };
                 if let Some(p) = p {
+                    let i = match d.reason { DoneReason::Stop=>0, DoneReason::Length=>1,
+                        DoneReason::Context=>2, DoneReason::Cancelled=>3, DoneReason::Error=>4 };
+                    M.engine_done[i].fetch_add(1, Ordering::Relaxed);
                     let _ = p.tx.send(Event::Done(d));
                 }
             }

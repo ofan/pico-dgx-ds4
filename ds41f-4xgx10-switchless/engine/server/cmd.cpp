@@ -1,3 +1,4 @@
+#include "common/telemetry.h"
 // Rank 0's commands and what every rank runs alike (cmd.h).
 #include <cstdlib>
 #include "server/cmd.h"
@@ -22,6 +23,10 @@
 namespace srv {
 
 std::vector<double> g_t_wait, g_t_late, g_t_launch;
+struct MetricsSlots {
+  explicit MetricsSlots(uint64_t n) { pico::metrics::set(pico::metrics::registry.slots, n); }
+  ~MetricsSlots() { pico::metrics::set(pico::metrics::registry.slots, 0); }
+};
 
 double now_s() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -200,6 +205,7 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
     wd.started = now_s();
     const model::SampleOut& o = m.wait(first + i);
     wd.started = 0;
+    pico::metrics::progress(pico::metrics::Decode);
     g_t_wait.push_back(now_s());
     if (i + 1 < launched) m.engram_late(o.next_pos0, o.next_rows, o.next_tok);  // step i + 1's rows
     g_t_late.push_back(now_s());
@@ -264,6 +270,7 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
 }  // namespace
 
 DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample& on) {
+  MetricsSlots telemetry_slots(1);
   g_t_wait.clear(), g_t_late.clear(), g_t_launch.clear();
   if (c.spec) return spec_loop(m, c, wd, on);
   auto may_run = [&](int i) { return i <= c.max_new && c.pos0 + i < c.limit; };
@@ -288,6 +295,7 @@ DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSampl
     wd.started = now_s();
     const model::SampleOut& o = m.wait(first + i);
     wd.started = 0;
+    pico::metrics::progress(pico::metrics::Decode);
     g_t_wait.push_back(now_s());
     const int32_t t = o.row[0].token;
     if (on) on(i, o, 0);
@@ -325,6 +333,7 @@ DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSampl
 
 std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
                                  const OnBatch& on) {
+  MetricsSlots telemetry_slots(e.size());
   g_t_wait.clear(), g_t_late.clear(), g_t_launch.clear();
   const int n = (int)e.size(), slot0 = m.slot();
   std::vector<BatchEnd> end(n);
@@ -388,6 +397,7 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vecto
     wd.started = now_s();
     const model::SampleOut& o = m.wait(s.id);
     wd.started = 0;
+    pico::metrics::progress(pico::metrics::Decode);
     g_t_wait.push_back(now_s());
     std::vector<int> row_of(n, -1);  // entry -> its row in this step
     for (int r = 0; r < s.R; ++r) row_of[s.ent[r]] = r;
@@ -424,6 +434,8 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vecto
         if (live[k] && !ending[k]) ++left, k1 = k;
       if (left == 1) stop(k1, kEndPause);
     }
+    pico::metrics::set(pico::metrics::registry.slots,
+        std::count(live.begin(), live.end(), char(1)));
     launch();
     g_t_launch.push_back(now_s());
   }
@@ -497,6 +509,7 @@ std::vector<float> batch_tf_loop(model::Model& m, const Cmd& c, const std::vecto
 // B3 (cmd.h): spec_loop's accounting per entry, over batch spec steps
 std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
                                        const OnBatch& on, SpecBatchStats* st) {
+  MetricsSlots telemetry_slots(e.size());
   constexpr int kD = model::ops::kDrafts;
   g_t_wait.clear(), g_t_late.clear(), g_t_launch.clear();
   const int n = (int)e.size(), slot0 = m.slot();
@@ -636,6 +649,7 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     wd.started = now_s();
     const model::SampleOut& o = m.wait(s.id);
     wd.started = 0;
+    pico::metrics::progress(pico::metrics::Decode);
     g_t_wait.push_back(now_s());
     for (int k = 0; k < n; ++k) {  // each entry's next rows, the device's choice
       if (!s.on[k]) continue;
@@ -717,6 +731,8 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     }
     bool any = false;
     for (int k = 0; k < n; ++k) any |= on_now(k);
+    pico::metrics::set(pico::metrics::registry.slots,
+        std::count(live.begin(), live.end(), char(1)));
     if (q.empty() && any) {  // not queued ahead: the rows are known now, its lookups go at once
       launch(false, false);
       late_rows(q.back());
@@ -734,7 +750,11 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
   int32_t sampled[model::kMaxRows];
   for (;;) {
     const Cmd c = bcast(ring, Cmd{});
-    if (c.op == kCmdStop) break;
+    pico::metrics::progress(pico::metrics::Scheduler);
+    if (c.op == kCmdStop) {
+      pico::metrics::set(pico::metrics::registry.initialization, 2);
+      break;
+    }
     NVTX_RANGE("cmd %d pos0 %d rows %d n %d", c.op, c.pos0, c.rows, c.n);
     if ((c.flags & model::kFlagProfile) && !prof) {
       CUDA_CHECK(cudaProfilerStart());
@@ -779,10 +799,12 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
       const uint64_t n = run_prefill(m, c);
       if (n != ~0ull) m.wait(n);
       m.drain();
+      pico::metrics::progress(pico::metrics::Prefill);
       wd.started = 0;
     } else if (c.op == kCmdRows) {
       wd.started = now_s();
       m.wait(run_rows(m, c));
+      pico::metrics::progress(pico::metrics::Prefill);
       wd.started = 0;
     } else if (c.op != kCmdState) {
       die("rank %d: unknown command %d", rank, c.op);

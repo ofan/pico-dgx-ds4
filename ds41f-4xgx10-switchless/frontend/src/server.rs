@@ -568,6 +568,9 @@ impl Gen {
             };
             match ev {
                 EngineEvent::Tokens(t) => {
+                    if self.first_token.is_none() {
+                        crate::metrics::M.ttft.observe(self.t0.elapsed());
+                    }
                     self.first_token.get_or_insert_with(Instant::now);
                     for &id in &t.ids {
                         self.ids.push(id);
@@ -876,6 +879,14 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
 }
 
 async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
+    crate::metrics::M.received.fetch_add(1, Ordering::Relaxed);
+    let response = chat_inner(app, headers, body).await;
+    let class = (response.status().as_u16() / 100).clamp(1, 5) as usize - 1;
+    crate::metrics::M.http_status[class].fetch_add(1, Ordering::Relaxed);
+    response
+}
+
+async fn chat_inner(app: Arc<App>, headers: HeaderMap, body: Bytes) -> Response {
     if let Err(r) = check_auth(&app, &headers) {
         return r;
     }

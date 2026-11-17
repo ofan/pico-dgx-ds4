@@ -5,6 +5,7 @@ pub mod engine;
 pub mod gate;
 pub mod guard;
 pub mod mock;
+pub mod metrics;
 pub mod protocol;
 pub mod pyjson;
 pub mod server;

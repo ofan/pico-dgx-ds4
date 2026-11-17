@@ -3,6 +3,7 @@
 // once: whatever reads it later is queued after whatever wrote it before. Blocks come from the pool
 // reserved at startup (state.h), so taking a snapshot inside the decode loop costs no allocation.
 #include "model/state.h"
+#include "common/telemetry.h"
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -25,6 +26,21 @@ namespace model {
 using namespace detail;
 
 namespace {
+
+// The model owner publishes after a mutation, never from the HTTP thread.
+struct PublishStore {
+  Model::Impl& m;
+  ~PublishStore() {
+    auto& t = pico::metrics::registry;
+    const auto* s = m.store_s.get();
+    pico::metrics::set(t.memory_bytes, s ? s->bytes : 0);
+    pico::metrics::set(t.memory_capacity, s ? s->pool.size : 0);
+    pico::metrics::set(t.ssd_bytes, s ? s->dbytes : 0);
+    pico::metrics::set(t.ssd_capacity, s && s->disk ? s->dpool.size : 0);
+    pico::metrics::set(t.sessions, s ? s->sess.size() : 0);
+    pico::metrics::set(t.state_observed, pico::metrics::wall_us());
+  }
+};
 
 constexpr size_t kArr[4] = {256, 32, 64, 4};  // bytes per entry: KV, KV scales, index key, key scales
 
@@ -251,6 +267,7 @@ uint64_t Model::Impl::state_kept_check(const std::string& base, uint64_t run_id,
 }
 
 void Model::Impl::state_disk(const std::string& base, size_t bytes, size_t staging, bool reuse, uint64_t run_id) {
+  PublishStore telemetry{*this};
   Store& s = store_of();
   if (s.disk) die("state: the disk tier is opened once");
   if (reuse && !s.kept_gen) die("state: reusing a kept file that was not checked");
@@ -334,6 +351,7 @@ void Model::Impl::state_keep(uint64_t gen) {
 }
 
 void Model::Impl::state_reserve(size_t bytes) {
+  PublishStore telemetry{*this};
   Store& s = store_of();
   if (s.pool.base) die("state: the store's pool is reserved once");
   bytes = bytes / kPoolGrain * kPoolGrain;
@@ -412,6 +430,7 @@ size_t Model::Impl::disk_take(int h, size_t bytes) {
 // the work queued so far and released at once, and the writer thread writes them out. Without a disk tier, or without room in it,
 // h is freed (gone: state_evicted).
 void Model::Impl::state_spill(int h) {
+  PublishStore telemetry{*this};
   Store& s = store_of();
   const auto it = s.sess.find(h);
   if (it == s.sess.end() || it->second.disk) return;
@@ -476,6 +495,7 @@ void Model::Impl::state_spill(int h) {
 // does not fit is dropped, as a save that finds no room would. Every block that comes back is checked
 // against its checksum from the way out; every rank logs a mismatch, and rank 0 the time it took.
 void Model::Impl::state_unspill(int h) {
+  PublishStore telemetry{*this};
   Store& s = store_of();
   const auto it = s.sess.find(h);
   if (it == s.sess.end() || !it->second.disk) return;
@@ -553,6 +573,7 @@ void Model::Impl::store_release(uint8_t* p, size_t bytes) {
 // (an entry is complete once its last position is in). Without room for every page, as far as the
 // pages go.
 void Model::Impl::state_save(int h, int from, int to) {
+  PublishStore telemetry{*this};
   Store::Sess& ss = use_blocks(*this, h);
   if (from > ss.saved) die("state: session %d saves [%d, %d) with %d saved", h, from, to, ss.saved);
   while ((int)ss.pages.size() * kPagePos < to) {
@@ -577,6 +598,7 @@ void Model::Impl::state_save(int h, int from, int to) {
 }
 
 void Model::Impl::state_load(int h, int to) {
+  PublishStore telemetry{*this};
   if (!store_of().sess.count(h)) die("state: session %d loads with nothing stored", h);
   Store::Sess& ss = use_blocks(*this, h);
   if (to > ss.saved) die("state: session %d loads %d positions of %d", h, to, ss.saved);
@@ -637,6 +659,7 @@ uint8_t* Model::Impl::state_snap_buf(int h, int pos) {
 }
 
 void Model::Impl::state_snap(int h, int pos) {
+  PublishStore telemetry{*this};
   if (pos < kSnapRows) die("state: snapshot at %d", pos);
   uint8_t* b = state_snap_buf(h, pos);
   if (!b) return;
@@ -657,6 +680,7 @@ void Model::Impl::state_snap_spec(int h, int pos) {
 }
 
 void Model::Impl::state_restore(int h, int pos) {
+  PublishStore telemetry{*this};
   if (!store_of().sess.count(h)) die("state: session %d restores with nothing stored", h);
   Store::Sess& ss = use_blocks(*this, h);
   if (!ss.snaps.count(pos)) die("state: session %d has no snapshot at %d", h, pos);
@@ -669,6 +693,7 @@ void Model::Impl::state_restore(int h, int pos) {
 }
 
 void Model::Impl::state_snap_end(int h, int pos) {
+  PublishStore telemetry{*this};
   Store::Sess& ss = use_blocks(*this, h);
   if (!ss.end) ss.end = store_alloc(h, end_bytes(spec != nullptr));
   if (!ss.end) {
@@ -690,6 +715,7 @@ void Model::Impl::state_snap_end(int h, int pos) {
 }
 
 void Model::Impl::state_restore_end(int h) {
+  PublishStore telemetry{*this};
   if (!store_of().sess.count(h)) die("state: session %d restores its end with nothing stored", h);
   Store::Sess& ss = use_blocks(*this, h);
   if (!ss.end) die("state: session %d has no end snapshot", h);
@@ -709,6 +735,7 @@ void Model::Impl::state_restore_end(int h) {
 // What session h holds from position `from` on no longer belongs to its history: snapshots above it,
 // the end snapshot if it is above, and saved positions from it on.
 void Model::Impl::state_drop(int h, int from) {
+  PublishStore telemetry{*this};
   Store& s = store_of();
   const auto it = s.sess.find(h);
   if (it == s.sess.end()) return;
@@ -749,6 +776,7 @@ void Model::Impl::state_drop(int h, int from) {
 }
 
 void Model::Impl::state_free(int h) {
+  PublishStore telemetry{*this};
   Store& s = store_of();
   const auto it = s.sess.find(h);
   if (it == s.sess.end()) return;
@@ -762,6 +790,7 @@ void Model::Impl::state_free(int h) {
 
 // src's snapshots up to upto into dst (src is kept while they are copied); those without room are not.
 void Model::Impl::state_copy_snaps(int src, int dst, int upto) {
+  PublishStore telemetry{*this};
   Store& s = store_of();
   const auto it = s.sess.find(src);
   if (it == s.sess.end() || src == dst) return;
@@ -780,6 +809,7 @@ void Model::Impl::state_copy_snaps(int src, int dst, int upto) {
 }
 
 void Model::Impl::state_drop_snap(int h, int pos) {
+  PublishStore telemetry{*this};
   Store& s = store_of();
   const auto it = s.sess.find(h);
   if (it == s.sess.end()) return;

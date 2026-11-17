@@ -9,6 +9,8 @@
 //! sessions across a planned stop, and the table is what finds them again. It holds the conversations'
 //! text, so its file is ours alone: mode 0600 in a directory of mode 0700, written whole or not at all.
 
+use crate::metrics::M;
+use std::sync::atomic::Ordering::Relaxed;
 use crate::tokenizer::Tokenizer;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -71,6 +73,7 @@ pub struct SessionTable {
     clock: u64,
     max_sessions: usize,
     max_tokens: usize,
+    retained_tokens: usize,
 }
 
 fn common_prefix(a: &[u8], b: &[u8]) -> usize {
@@ -135,7 +138,8 @@ impl SessionTable {
     /// so that a table begun afresh never reuses an earlier one's ids, whose sessions the engine may
     /// still keep.
     pub fn new(max_sessions: usize, max_tokens: usize) -> Self {
-        SessionTable { sessions: HashMap::new(), next_id: (unix_now() << 20).max(1), clock: 0, max_sessions, max_tokens }
+        M.token_budget.store(max_tokens as u64, Relaxed);
+        SessionTable { retained_tokens: 0, sessions: HashMap::new(), next_id: (unix_now() << 20).max(1), clock: 0, max_sessions, max_tokens }
     }
 
     /// The table for the next start: the sessions not in a request and used within `max_age_s`,
@@ -251,7 +255,9 @@ impl SessionTable {
         let k = got.len();
         self.next_id = self.next_id.max(next_id).max(got.keys().max().map_or(0, |m| m + 1));
         self.clock = self.clock.max(clock);
+        self.retained_tokens = got.values().map(|s| s.ids.len()).sum();
         self.sessions = got;
+        self.publish_metrics();
         let _ = self.evict(0);
         Ok(k)
     }
@@ -348,17 +354,20 @@ impl SessionTable {
             ends.push(at);
         }
         debug_assert_eq!(at, text.len());
+        self.retained_tokens = self.retained_tokens - s.ids.len() + ids.len();
         s.text = text;
         s.ids = ids;
         s.ends = ends;
         s.prompt_len = prompt_text.len();
         s.busy = false;
+        self.publish_metrics();
     }
 
     /// The request failed: forget the session (the engine's copy is in an unknown state; the
     /// caller releases it).
     pub fn abandon(&mut self, session_id: u64) {
-        self.sessions.remove(&session_id);
+        if let Some(s) = self.sessions.remove(&session_id) { self.retained_tokens -= s.ids.len(); }
+        self.publish_metrics();
     }
 
     /// Drop least recently used idle sessions over the limits; returns their ids.
@@ -367,17 +376,23 @@ impl SessionTable {
         loop {
             let total: usize = self.sessions.values().map(|s| s.ids.len()).sum();
             if self.sessions.len() <= self.max_sessions && total <= self.max_tokens {
+                self.publish_metrics();
                 return out;
             }
             let victim = self.sessions.iter().filter(|(&id, s)| id != keep && !s.busy).min_by_key(|(_, s)| s.last_used).map(|(&id, _)| id);
             match victim {
                 Some(id) => {
-                    self.sessions.remove(&id);
+                    if let Some(s) = self.sessions.remove(&id) { self.retained_tokens -= s.ids.len(); }
                     out.push(id);
                 }
-                None => return out,
+                None => { self.publish_metrics(); return out; },
             }
         }
+    }
+
+    fn publish_metrics(&self) {
+        M.sessions.store(self.sessions.len() as u64, Relaxed);
+        M.retained.store(self.retained_tokens as u64, Relaxed);
     }
 
     pub fn len(&self) -> usize {
