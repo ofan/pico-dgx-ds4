@@ -465,6 +465,7 @@ void bcast_tf(comm::Ring& ring, const Cmd& c, std::vector<BatchEntry>& e, std::v
 std::vector<float> batch_tf_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e,
                                  const std::vector<std::vector<int32_t>>& tokens, Watchdog& wd, const OnBatch& on,
                                  model::Sink* sink) {
+  MetricsSlots telemetry_slots(0);
   const int n = (int)e.size(), G = c.rows;
   if (n < 1 || n > model::ops::kMaxSess || G < 1 || G > model::kMaxSessRows || (int)tokens.size() != n)
     die("batch_tf: %d entries, %d rows of each per step (1..%d)", n, G, model::kMaxSessRows);
@@ -494,6 +495,8 @@ std::vector<float> batch_tf_loop(model::Model& m, const Cmd& c, const std::vecto
       fed[k] += rows;
     }
     if (!b.R) break;
+    // Count participating entries, not rows: one teacher-forced entry can have G rows.
+    pico::metrics::set(pico::metrics::registry.slots, b.nsess);
     b.flags = c.flags;
     b.sink = sink;
     wd.started = now_s();

@@ -100,7 +100,7 @@ std::string Endpoint::render() const {
   const char* phases[]={"scheduler","prefill","decode"};
   for(size_t i=0;i<3;++i) o<<"pico:inference_progress_timestamp_seconds{"<<labels_<<",phase=\""<<phases[i]<<"\"} "<<read(registry.progress[i])/1e6<<'\n';
   scalar("kv_cache_usage_available","gauge","Zero: no vLLM block-pool equivalent; kv_cache_usage_perc intentionally absent.",0);
-  gauge("slots_active","Rows in the current decode step; not cached sessions.",registry.slots);
+  gauge("slots_active","Entries participating in decode (including teacher forcing and draining rows); zero outside decode.",registry.slots);
   gauge("slots_capacity","Configured logical session slots.",registry.slots_capacity);
   gauge("context_capacity_tokens","Sum of configured slot context limits; not physical KV bytes.",registry.context_capacity);
   o<<"# HELP pico:session_usage_bytes Logical allocated snapshot bytes; not active KV.\n# TYPE pico:session_usage_bytes gauge\n"

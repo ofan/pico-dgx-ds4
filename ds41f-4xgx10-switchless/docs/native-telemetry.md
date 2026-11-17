@@ -1,6 +1,10 @@
 # Native telemetry: as-built contract and qualification gates
 
-Status: **implemented trial feature; NOT GPU-qualified; NOT deployed**.
+Status: **implemented r3 trial feature; NOT GPU-qualified; NOT deployed**.
+Trial tag: `harbor.lab.tf/library/pico-dsgx10:2026.11.16-native-telemetry-trial-r3`.
+This revision closes teacher-forced slot accounting and aligns the HELP unit
+with the contract: entries, not rows. The immutable image digest and CPU test
+receipts are recorded outside source with the r3 build artifacts.
 Baseline: `b7c3eb5b12a030725bfb0186d27065bc6e376685` (native vision).
 No sampling, steering, KV precision, request budget, scheduling or wire-protocol
 change is part of this feature. The existing GLP-39 and model settings remain
@@ -106,7 +110,7 @@ strings are labels. All names below have the `pico:` prefix. Types `counter` and
 | `process_start_time_seconds` | gauge | Timestamp when native telemetry was initialized near process entry. |
 | `initialization_state` | gauge | 0 loading, 1 rank ready after startup barrier, 2 stopping. Read with heartbeat and external health, not alone. |
 | `inference_progress_timestamp_seconds` | gauge / `phase=scheduler,prefill,decode` (separate values) | Last owner progress boundary. Zero before the phase first runs; idle progress need not advance. Followers update scheduler after receiving a command, not while blocked waiting for one. |
-| `slots_active` | gauge | Entries still participating in the current decode loop; includes a last queued row draining after stop. Zero outside decode, so not a prefill-occupancy metric. |
+| `slots_active` | gauge | Entries participating in decode (including teacher forcing and draining rows); zero outside decode. Teacher-forced steps count entries with rows in that step, not the total number of rows. Not a prefill-occupancy metric. |
 | `slots_capacity` | gauge | Configured logical slots. |
 | `context_capacity_tokens` | gauge | Sum of configured slot context limits, not physical cache bytes. |
 | `kv_cache_usage_available` | gauge | **0**: a vLLM-style allocated-block usage fraction has no exact mapping implemented. |
@@ -191,12 +195,19 @@ out=$(mktemp -d)
 g++ -std=c++20 -O2 -Wall -Wextra -Werror -pthread -I engine \
   engine/server/metrics.cpp engine/server/tests/metrics_test.cpp -o "$out/metrics_test"
 "$out/metrics_test"
+python3 engine/server/tests/metrics_teacher_forcing_test.py --out "$out/teacher-forcing"
 # Python environment needs prometheus_client; it is an independent text parser.
 python3 engine/server/tests/metrics_endpoint_test.py "$out/metrics_test" --seconds 130
 CARGO_TARGET_DIR="$out/rust" cargo test --locked --manifest-path frontend/Cargo.toml
 CARGO_TARGET_DIR="$out/rust" cargo build --locked --manifest-path frontend/Cargo.toml --example metrics_fixture
 python3 engine/server/tests/metrics_endpoint_test.py "$out/rust/debug/examples/metrics_fixture" --frontend --seconds 130
 ```
+
+The teacher-forcing CPU test compiles the unchanged `batch_tf_loop` body from
+`cmd.cpp` against a model double: unequal lengths and zero-length entries must
+move `slots_active` through 3, 2, 1, then 0, including unwind cleanup. It checks
+the rendered metric and its HELP text. This tests accounting control flow, not
+GPU execution or token parity.
 
 The long CPU fixture simulates 16 admitted requests and queued/error outcomes
 while deliberately stopping its producer for 125 seconds. This proves listener
