@@ -4,6 +4,7 @@
 #include "model/model.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -131,6 +132,16 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
     CUDA_CHECK(cudaMemcpy(glp_alpha, &glp.alpha, sizeof(float), cudaMemcpyHostToDevice));
     if (rank == 0) std::printf("glp: steering on: alpha %g, %d layers, hook residual_stream_post_layer\n", glp.alpha, n);
   }
+  {
+    // The runtime control starts from exactly the startup configuration: epoch 0, no behaviour change.
+    SteerConfig sc;
+    sc.on = glp.on;
+    sc.alpha = glp.alpha;
+    for (int L = 0; L < kLayers; ++L)
+      if (glp.layer[L]) sc.layers |= 1ull << L;
+    sc.vector_id = glp.on ? steer_directions_id(glp.dir.data(), glp.dir.size()) : 0;
+    steer = SteerState(sc);
+  }
   x = dalloc<bf16>((size_t)R * kHcDim);
   mid = dalloc<bf16>((size_t)R * kHcDim);
   y = dalloc<bf16>((size_t)R * kDim);
@@ -228,6 +239,75 @@ void Model::Impl::steer_layer(int L, int R, const float* pre, bf16* yraw) {
     ops::glp_fold_steer(U(x), R, glp_dir + (size_t)L * kDim, glp_alpha, U(sub), U(mid), f_post, f_comb,
                        pre, yraw ? U(yraw) : nullptr, st);
   }
+}
+
+// The runtime alpha, applied between steps (docs/steering-control.md). Every refusal leaves the state
+// untouched; the caller rolls back nothing on a refusal because nothing moved.
+bool Model::Impl::steer_set(float alpha, uint64_t expect_epoch, float* confirmed, uint64_t* epoch, std::string* why) {
+  if (!glp.on) {
+    *why = "steering is off (WEIGHTLESS_STEER_PATH is unset); an alpha alone does not enable it";
+    return false;
+  }
+  if (!(std::isfinite(alpha)) || alpha < kSteerAlphaMin || alpha > kSteerAlphaMax) {
+    char buf[128];
+    std::snprintf(buf, sizeof buf, "alpha is outside [%g, %g]", (double)kSteerAlphaMin, (double)kSteerAlphaMax);
+    *why = buf;
+    return false;
+  }
+  if (expect_epoch != kSteerAnyEpoch && steer.epoch() != expect_epoch) {
+    *why = "the caller's epoch view is stale";
+    return false;
+  }
+  if (n_steps != n_done) {  // a launched step has not been waited for: not a step boundary
+    *why = "a step is in flight";
+    return false;
+  }
+  sync();  // nothing queued on the model's stream either
+  if (steer.check(alpha) == SteerCheck::kNoop) {
+    *confirmed = steer.config().alpha;
+    *epoch = steer.epoch();
+    return true;
+  }
+  float back = 0.f;
+  CUDA_CHECK(cudaMemcpy(glp_alpha, &alpha, sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(&back, glp_alpha, sizeof(float), cudaMemcpyDeviceToHost));
+  if (std::memcmp(&back, &alpha, sizeof(float)) != 0) {
+    *why = "the device read-back differs from the value written";
+    return false;
+  }
+  glp.alpha = back;  // the layer boundaries' host branch (steer_layer, prefill.cu) reads this
+  const uint64_t e = steer.commit(back);
+  // No graph may replay a capture made under another steering state. Dropping them is the invalidation:
+  // the next step of each (rows, context bucket) is captured again. The kernels have run, so a capture
+  // needs no further warm-up. Both caches go: this one, and the spec step graphs, whose bodies run the
+  // same layer loop (the steering branch, and whether the pre-write copy `sub` is made, are host
+  // decisions taken at capture time, so a graph is only valid for the alpha it was captured under).
+  const size_t dropped = graphs.size();
+  for (auto& g : graphs) CUDA_CHECK(cudaGraphExecDestroy(g.second));
+  graphs.clear();
+  spec_drop_graphs();
+  *confirmed = back;
+  *epoch = e;
+  if (rank == 0)
+    std::printf("glp: runtime alpha %g at epoch %llu (%zu step graphs dropped)\n", (double)back,
+                (unsigned long long)e, dropped);
+  return true;
+}
+
+Model::SteerInfo Model::steer_info() const {
+  SteerInfo i;
+  i.on = d_->glp.on;
+  i.alpha = d_->glp.alpha;
+  i.epoch = d_->steer.epoch();
+  i.config_id = d_->steer.id();
+  i.layers = d_->steer.config().layers;
+  return i;
+}
+
+uint64_t Model::steer_epoch() const { return d_->steer.epoch(); }
+
+bool Model::steer_set(float alpha, uint64_t expect_epoch, float* confirmed, uint64_t* epoch, std::string* why) {
+  return d_->steer_set(alpha, expect_epoch, confirmed, epoch, why);
 }
 
 void Model::Impl::dump(Sink* sink, int L, const char* name, int pos0, int R, const void* dev, size_t row_bytes) {

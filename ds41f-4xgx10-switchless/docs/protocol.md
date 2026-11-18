@@ -20,7 +20,8 @@ stream socket that rank 0 listens on. The message layouts are in
 
 - Payloads are a fixed struct (a multiple of 8 bytes) followed by arrays in the order given below.
   All integers are little-endian, floats are IEEE `float`. There is no padding between arrays.
-- Both sides send `HELLO` first and close the connection if the other side's `version` differs.
+- Both sides send `HELLO` first and close the connection if the other side's `version` differs
+  (the current version is 3: 2 added `STEER_SET`, `STEER_STATE`; 1 was the vision frames).
 - Either side may close the socket at any time. The front-end reconnects with backoff and fails the
   requests that were in flight; rank 0 cancels everything the old connection submitted.
 - Rank 0 must never block on the socket: the front-end reads continuously. Frames from rank 0 for
@@ -36,6 +37,8 @@ Front-end → rank 0
 | 0x02 | `SUBMIT` | `SubmitHeader`, `u32 stop_ids[n_stop_ids]`, `u32 prompt[n_prompt]` |
 | 0x03 | `CANCEL` | `{u64 req_id}` |
 | 0x04 | `RELEASE` | `{u64 session_id}`: the front-end will not continue this session; free its state |
+| 0x05 | `STEER_SET` | `SteerSetHeader` `{u64 req_id; f32 alpha; u32 reserved = 0}`: set one GLP alpha for all traffic ([steering-control.md](steering-control.md)) |
+| 0x06 | `STEER_GET` | `{u64 req_id}`: read the effective steering state back, changing nothing |
 
 Rank 0 → front-end
 
@@ -44,6 +47,7 @@ Rank 0 → front-end
 | 0x81 | `HELLO` | `{u32 version; u32 max_context; u32 vocab_size; u32 eos_id; u32 max_sessions; u32 name_len}`, `char name[name_len]` |
 | 0x82 | `TOKENS` | `{u64 req_id; u32 n; u32 flags}`, `u32 ids[n]`, then `f32 logprob[n]` if `flags & 1`, then `n * n_top` pairs `{u32 id; f32 logprob}` if `flags & 2` |
 | 0x83 | `DONE` | `DoneHeader`, `char error[error_len]` |
+| 0x84 | `STEER_STATE` | `SteerStateHeader`, `SteerRank ranks[n_ranks]`, `char error[error_len]`: the answer to `STEER_SET` and `STEER_GET` |
 
 ```
 struct SubmitHeader {            // 72 bytes
@@ -74,6 +78,30 @@ struct DoneHeader {              // 56 bytes
   uint64_t decode_us;            // first token → DONE
   uint32_t error_len;
   uint32_t reserved;
+};
+```
+
+`STEER_STATE` is answered on the same connection, with `req_id` as the `STEER_SET`/`STEER_GET`
+carried it:
+
+```
+struct SteerStateHeader {        // 40 bytes
+  uint64_t req_id;
+  uint64_t epoch;                // the configuration epoch (0 until the first applied set)
+  float    alpha;                // the effective alpha
+  uint32_t on;                   // 1: a direction file is loaded
+  uint32_t n_ranks;              // 4
+  uint32_t ok;                   // 1: applied (or read) and confirmed on every rank
+  uint32_t error_len;            // bytes of error text after the ranks
+  uint32_t pad;                  // 0
+};
+struct SteerRank {               // 120 bytes, one per rank, in rank order
+  uint64_t epoch;                // that rank's epoch
+  float    alpha;                // that rank's own read-back of the device
+  int32_t  rank;
+  int32_t  ok;
+  char     why[96];              // why not, "" when ok
+  int32_t  pad;                  // 0
 };
 ```
 

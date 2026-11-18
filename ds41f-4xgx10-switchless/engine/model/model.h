@@ -215,6 +215,26 @@ class Model {
   int spec_batch_rows() const;
   uint64_t launch_spec_batch(const SpecBatch& b);
   uint64_t launch_verify_batch(const SpecBatch& b);
+  // GLP steering, runtime control (steer.h, docs/steering-control.md). The effective configuration and
+  // its epoch, the same on every rank once a set has been confirmed. Per rank: a caller that aggregates
+  // must not average them.
+  struct SteerInfo {
+    bool on = false;
+    float alpha = 0.f;
+    uint64_t epoch = 0;
+    uint64_t config_id = 0;
+    uint64_t layers = 0;
+  };
+  SteerInfo steer_info() const;
+  // Apply one alpha to all traffic at a step boundary: refused when steering is off, when the value is
+  // outside [kSteerAlphaMin, kSteerAlphaMax], when the caller's epoch view is stale, or when a step is
+  // still in flight (call drain() first, or between commands). The device scalar is written and read
+  // back; the host copy the layer boundary reads follows it; the CUDA step graphs are dropped, so no
+  // graph captured under another steering state can replay. On any failure nothing changes.
+  // Returns true and the confirmed value, otherwise false and why.
+  bool steer_set(float alpha, uint64_t expect_epoch, float* confirmed, uint64_t* epoch, std::string* why);
+  uint64_t steer_epoch() const;  // the epoch a new request's state is tagged with
+
   unsigned spec_batch_mismatches() const;
   // engram_late() of a batch verify step: its rows as the device laid them out (the entries on in entry
   // order, each its next_s* of the step before): their tokens, positions and slots.

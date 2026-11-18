@@ -729,6 +729,56 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
   return end;
 }
 
+// Every rank's part of a steering set (docs/steering-control.md): apply, or confirm, at this step
+// boundary, then exchange the four confirmations. Rank divergence is detected here, never assumed away.
+static SteerAck steer_sync_all(model::Model& m, comm::Ring& ring, float alpha, uint64_t epoch, int rank, bool apply,
+                              SteerAck all[4]) {
+  SteerAck mine;
+  mine.rank = rank;
+  std::string why;
+  if (!apply) {
+    const model::Model::SteerInfo i = m.steer_info();
+    mine.alpha = i.alpha;
+    mine.epoch = i.epoch;
+    mine.ok = i.on ? 1 : 0;
+    if (!i.on) std::snprintf(mine.why, sizeof mine.why, "steering is off");
+  } else {
+    float conf = 0.f;
+    uint64_t got = 0;
+    if (m.steer_set(alpha, epoch, &conf, &got, &why)) {
+      mine.alpha = conf;
+      mine.epoch = got;
+      mine.ok = 1;
+    } else {
+      const model::Model::SteerInfo i = m.steer_info();
+      mine.alpha = i.alpha;
+      mine.epoch = i.epoch;
+      mine.ok = 0;
+      std::snprintf(mine.why, sizeof mine.why, "%s", why.empty() ? "refused" : why.c_str());
+    }
+  }
+  std::memset(all, 0, 4 * sizeof(SteerAck));
+  ring.allgather_host(&mine, all, sizeof(SteerAck));
+  return all[0];  // every rank gets the same array back; rank 0 reads all four
+}
+
+void steer_broadcast(model::Model& m, comm::Ring& ring, float alpha, uint64_t epoch, SteerAck all[4]) {
+  Cmd c{};
+  c.op = kCmdSteer;
+  c.steer_alpha = alpha;
+  c.steer_epoch = epoch;
+  bcast(ring, c);  // the followers take the branch below and meet this rank in the ack all-gather
+  steer_sync_all(m, ring, alpha, epoch, 0, true, all);
+}
+
+void steer_readback(model::Model& m, comm::Ring& ring, SteerAck all[4]) {
+  Cmd c{};
+  c.op = kCmdSteer;
+  c.flags = kSteerConfirm;
+  bcast(ring, c);
+  steer_sync_all(m, ring, 0.f, model::kSteerAnyEpoch, 0, false, all);
+}
+
 void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
   bool prof = false;
   int32_t sampled[model::kMaxRows];
@@ -784,6 +834,11 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
       wd.started = now_s();
       m.wait(run_rows(m, c));
       wd.started = 0;
+    } else if (c.op == kCmdSteer) {
+      SteerAck all[4];
+      steer_sync_all(m, ring, c.steer_alpha, c.steer_epoch, rank, (c.flags & kSteerConfirm) == 0, all);
+      if (!all[rank].ok)
+        std::fprintf(stderr, "rank %d: steering set refused: %s\n", rank, all[rank].why);
     } else if (c.op != kCmdState) {
       die("rank %d: unknown command %d", rank, c.op);
     }

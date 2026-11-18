@@ -1,7 +1,7 @@
 //! Client side of the rank-0 socket: one connection, many requests multiplexed by req_id.
 //! Reconnects with backoff; requests in flight when the connection drops end with an error.
 
-use crate::protocol::{read_frame, Done, DoneReason, Frame, HelloEngine, Submit, Tokens, VERSION};
+use crate::protocol::{read_frame, Done, DoneReason, Frame, HelloEngine, SteerState, Submit, Tokens, VERSION};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 #[derive(Debug)]
 pub enum Event {
@@ -26,12 +26,15 @@ struct Pending {
 struct Conn {
     tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     pending: HashMap<u64, Pending>,
+    /// steering requests in flight, by req_id
+    steering: HashMap<u64, SteerTx>,
 }
 
 struct Inner {
     path: PathBuf,
     conn: Mutex<Conn>,
     next_req: AtomicU64,
+    next_steer: AtomicU64,
     info: watch::Sender<Option<HelloEngine>>,
 }
 
@@ -40,11 +43,20 @@ pub struct EngineClient {
     inner: Arc<Inner>,
 }
 
+/// The steering control's answer to one request (STEER_STATE arrives on the same connection).
+type SteerTx = oneshot::Sender<SteerState>;
+
 impl EngineClient {
     /// Start connecting to the engine socket (in the background, forever).
     pub fn start(path: PathBuf) -> EngineClient {
         let (info, _) = watch::channel(None);
-        let inner = Arc::new(Inner { path, conn: Mutex::new(Conn::default()), next_req: AtomicU64::new(1), info });
+        let inner = Arc::new(Inner {
+            path,
+            conn: Mutex::new(Conn::default()),
+            next_req: AtomicU64::new(1),
+            next_steer: AtomicU64::new(1),
+            info,
+        });
         tokio::spawn(run(inner.clone()));
         EngineClient { inner }
     }
@@ -75,6 +87,45 @@ impl EngineClient {
         Ok((s.req_id, rx))
     }
 
+    /// Set one global alpha for all traffic (docs/steering-control.md): the engine applies it at a step
+    /// boundary on every rank and answers with each rank's read-back. The caller is responsible for
+    /// having stopped admitting requests first (gate::quiesce).
+    pub async fn steer_set(&self, alpha: f32, timeout: Duration) -> Result<SteerState, String> {
+        self.steer(Frame::SteerSet { req_id: 0, alpha }, timeout).await
+    }
+
+    /// Read the effective steering state back from every rank, changing nothing.
+    pub async fn steer_get(&self, timeout: Duration) -> Result<SteerState, String> {
+        self.steer(Frame::SteerGet { req_id: 0 }, timeout).await
+    }
+
+    async fn steer(&self, frame: Frame, timeout: Duration) -> Result<SteerState, String> {
+        let id = self.inner.next_steer.fetch_add(1, Ordering::Relaxed);
+        let frame = match frame {
+            Frame::SteerSet { alpha, .. } => Frame::SteerSet { req_id: id, alpha },
+            Frame::SteerGet { .. } => Frame::SteerGet { req_id: id },
+            _ => return Err("not a steering frame".into()),
+        };
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut c = self.inner.conn.lock().unwrap();
+            let wtx = c.tx.clone().ok_or("engine not connected")?;
+            c.steering.insert(id, tx);
+            if wtx.send(frame.encode()).is_err() {
+                c.steering.remove(&id);
+                return Err("engine not connected".into());
+            }
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(st)) => Ok(st),
+            Ok(Err(_)) => Err("the engine connection dropped the steering request".into()),
+            Err(_) => {
+                self.inner.conn.lock().unwrap().steering.remove(&id);
+                Err(format!("no answer from the engine in {} s", timeout.as_secs()))
+            }
+        }
+    }
+
     pub fn cancel(&self, req_id: u64) {
         self.send(Frame::Cancel { req_id });
     }
@@ -103,11 +154,12 @@ async fn run(inner: Arc<Inner>) {
                     Err(e) => eprintln!("engine: connection lost: {e}"),
                 }
                 inner.info.send_replace(None);
-                let pending = {
+                let (pending, steering) = {
                     let mut c = inner.conn.lock().unwrap();
                     c.tx = None;
-                    std::mem::take(&mut c.pending)
+                    (std::mem::take(&mut c.pending), std::mem::take(&mut c.steering))
                 };
+                drop(steering);  // their receivers see the cancel
                 for (req_id, p) in pending {
                     let _ = p.tx.send(Event::Done(Done {
                         req_id,
@@ -179,6 +231,12 @@ async fn connection(inner: &Arc<Inner>, stream: UnixStream) -> Result<(), String
                 let c = inner.conn.lock().unwrap();
                 if let Some(p) = c.pending.get(&t.req_id) {
                     let _ = p.tx.send(Event::Tokens(t));
+                }
+            }
+            Ok(Frame::SteerState(st)) => {
+                let tx = inner.conn.lock().unwrap().steering.remove(&st.req_id);
+                if let Some(tx) = tx {
+                    let _ = tx.send(st);
                 }
             }
             Ok(Frame::Done(d)) => {

@@ -7,7 +7,7 @@
 
 namespace fe {
 
-constexpr uint32_t kVersion = 2;
+constexpr uint32_t kVersion = 3;  // 3: STEER_SET and STEER_STATE (docs/steering-control.md)
 constexpr const char* kDefaultSocket = "/tmp/dsgb10-engine.sock";
 
 enum MsgType : uint16_t {
@@ -16,10 +16,15 @@ enum MsgType : uint16_t {
   kSubmit = 0x02,   // SubmitHeader, uint32 stop_ids[n_stop_ids], uint32 prompt[n_prompt]
   kCancel = 0x03,   // Cancel
   kRelease = 0x04,  // Release
+  // steering (docs/steering-control.md): the operator's global runtime alpha. STEER_GET reads the
+  // effective state back without changing it. Both are answered with STEER_STATE.
+  kSteerSet = 0x05,  // SteerSetHeader
+  kSteerGet = 0x06,  // SteerGet
   // rank 0 -> front-end
   kHelloEngine = 0x81,  // HelloEngine, char name[name_len]
   kTokens = 0x82,       // TokensHeader, uint32 ids[n], [float logprob[n]], [TopLogprob top[n * n_top]]
   kDone = 0x83,         // DoneHeader, char error[error_len]
+  kSteerState = 0x84,   // SteerStateHeader, SteerRank ranks[n_ranks], char error[error_len]
 };
 
 struct FrameHeader {
@@ -68,6 +73,43 @@ struct SubmitHeader {
   uint32_t n_stop_ids;       // ids that end generation (EOS is in here)
   uint32_t n_prompt;         // >= 1
   uint32_t reserved;
+};
+
+// One rank's confirmation of a steering set: what it holds after the change, and whether it agrees.
+// Layout is explicit (no implicit padding): epoch, alpha, rank, ok, why[96], pad = 120 bytes.
+struct SteerRank {
+  uint64_t epoch;  // its epoch
+  float alpha;     // the rank's effective alpha (its own read-back)
+  int32_t rank;    // 0..3
+  int32_t ok;      // 1: this rank applied the value and holds it
+  char why[96];    // why not, NUL-terminated ("" when ok)
+  int32_t pad;     // 0
+};
+
+// The operator's set request: one alpha for all traffic. `reserved` must be 0.
+struct SteerSetHeader {
+  uint64_t req_id;
+  float alpha;
+  uint32_t reserved;
+};
+
+struct SteerGet {
+  uint64_t req_id;
+};
+
+// The answer to STEER_SET and STEER_GET. n_ranks is 4 for a settled state; a refusal carries the error
+// text and the state as it stands (unchanged).
+// Layout is explicit (no implicit padding): req_id, epoch, alpha, on, n_ranks, ok, error_len, pad = 40
+// bytes.
+struct SteerStateHeader {
+  uint64_t req_id;
+  uint64_t epoch;
+  float alpha;
+  uint32_t on;         // 1: steering is on in the engine
+  uint32_t n_ranks;    // 4
+  uint32_t ok;         // 1: applied (or read) and confirmed on every rank
+  uint32_t error_len;  // bytes of error text after the ranks
+  uint32_t pad;        // 0
 };
 
 struct Cancel {

@@ -21,6 +21,7 @@
 #include "model/glp.h"
 #include "model/model.h"
 #include "model/ops.h"
+#include "model/steer.h"
 
 namespace model {
 namespace detail {
@@ -126,7 +127,11 @@ struct Model::Impl {
   // off dir[L] at the boundary that ends layer L, in both the decode/verify step and a prefill chunk.
   detail::GlpCfg glp;
   float *glp_dir = nullptr, *glp_alpha = nullptr;
+  // The runtime control over glp.alpha (steer.h, docs/steering-control.md): one configuration for all
+  // traffic, a monotonic epoch, and the accepted range. Applied only between steps (steer_set).
+  SteerState steer;
   void steer_layer(int L, int R, const float* pre, bf16* yraw);
+  bool steer_set(float alpha, uint64_t expect_epoch, float* confirmed, uint64_t* epoch, std::string* why);
 
   // weights
   detail::LayerW lw[kLayers];
@@ -370,6 +375,10 @@ struct Model::Impl {
   void spec_prefill_accept(int a, int M, int handle, const std::vector<int>& snaps, bool ced, bool sampled);
   cudaGraphExec_t spec_graph(int ctx);
   void spec_graphs();
+  // Drop every captured spec step graph (one-session and batch): their bodies run the layer loop, whose
+  // steering branch is chosen on the host at capture time (model.cu's steer_fold), so a graph is only
+  // valid for the steering state it was captured under. Recaptured on next use (spec_graph).
+  void spec_drop_graphs();
   void spec_fill(ops::StepIn& in, int mode, const SpecCfg& c);
   uint64_t launch_spec(int R, int pos0, const int32_t* tokens, const Sampling& sp, const SpecCfg& c);
   uint64_t launch_verify(const Sampling& sp, const SpecCfg& c, int pos_bound);

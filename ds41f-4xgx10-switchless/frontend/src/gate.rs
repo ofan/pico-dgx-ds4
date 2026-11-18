@@ -8,6 +8,7 @@
 //! request in flight is never cut: the hold waits for it.
 
 use crate::engine::EngineClient;
+use crate::protocol::SteerState;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,8 @@ const POLL: Duration = Duration::from_millis(200);
 struct State {
     /// requests wait: the ring is lent (since then)
     held: Option<Instant>,
+    /// requests wait: a steering change is draining and applying (docs/steering-control.md)
+    steering: bool,
     /// the server is shutting down: waiting requests are answered at once
     closing: bool,
     in_flight: u32,
@@ -48,6 +51,17 @@ impl Drop for Pass {
         let mut s = self.gate.st.lock().unwrap();
         s.in_flight -= 1;
         s.last = Instant::now();
+    }
+}
+
+/// Requests are held off while a steering change drains and applies; dropping it admits them again.
+pub struct Quiesced {
+    gate: Arc<Gate>,
+}
+
+impl Drop for Quiesced {
+    fn drop(&mut self) {
+        self.gate.st.lock().unwrap().steering = false;
     }
 }
 
@@ -80,7 +94,16 @@ pub enum Refused {
 impl Gate {
     pub fn new(hold: Duration) -> Arc<Gate> {
         Arc::new(Gate {
-            st: Mutex::new(State { held: None, closing: false, in_flight: 0, waiting: 0, last: Instant::now(), passed: 0, refused: 0 }),
+            st: Mutex::new(State {
+                held: None,
+                steering: false,
+                closing: false,
+                in_flight: 0,
+                waiting: 0,
+                last: Instant::now(),
+                passed: 0,
+                refused: 0,
+            }),
             hold,
         })
     }
@@ -103,7 +126,7 @@ impl Gate {
                 if s.closing {
                     return Err(Refused::Closing);
                 }
-                if s.held.is_none() && connected() {
+                if s.held.is_none() && !s.steering && connected() {
                     s.in_flight += 1;
                     s.last = Instant::now();
                     if w.counted {
@@ -143,6 +166,40 @@ impl Gate {
         Ok(())
     }
 
+    /// Stop admitting requests and wait for those in flight to finish, so that a steering change lands
+    /// at a boundary no request crosses. The guard's drop admits again. A request already in flight is
+    /// never cut: it finishes under the alpha it started with.
+    pub async fn quiesce(self: &Arc<Gate>, timeout: Duration) -> Result<Quiesced, String> {
+        {
+            let mut s = self.st.lock().unwrap();
+            if s.steering {
+                return Err("a steering change is already in progress".into());
+            }
+            s.steering = true;
+        }
+        let t0 = Instant::now();
+        loop {
+            {
+                let s = self.st.lock().unwrap();
+                if s.in_flight == 0 {
+                    return Ok(Quiesced { gate: self.clone() });
+                }
+            }
+            if t0.elapsed() >= timeout {
+                let s = self.st.lock().unwrap();
+                let msg = format!(
+                    "busy: {} request(s) still in flight after {} s",
+                    s.in_flight,
+                    timeout.as_secs()
+                );
+                drop(s);
+                self.st.lock().unwrap().steering = false;
+                return Err(msg);
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
     pub fn release(&self) {
         let mut s = self.st.lock().unwrap();
         if let Some(t) = s.held.take() {
@@ -159,7 +216,7 @@ impl Gate {
         let s = self.st.lock().unwrap();
         format!(
             "held {} in_flight {} waiting {} idle_s {} engine {} held_s {} passed {} refused {}",
-            s.held.is_some() as u8,
+            (s.held.is_some() || s.steering) as u8,
             s.in_flight,
             s.waiting,
             s.last.elapsed().as_secs(),
@@ -173,7 +230,7 @@ impl Gate {
     /// Whether a request would pass now, without waiting: the ring not lent, the engine connected.
     pub fn open(&self, connected: bool) -> bool {
         let s = self.st.lock().unwrap();
-        !s.closing && s.held.is_none() && connected
+        !s.closing && s.held.is_none() && !s.steering && connected
     }
 
     /// Whether requests wait because the ring is lent (for /health).
@@ -190,12 +247,66 @@ impl Gate {
                 Ok(n) => self.hold(Duration::from_secs(n)).map_or_else(|e| e, |()| "ok".into()),
                 Err(_) => "error: hold IDLE_S (seconds)".into(),
             },
+            ["steer"] => "error: steer ALPHA (0.0 to 2.0)".into(),
             ["release"] => {
                 self.release();
                 "ok".into()
             }
-            _ => "error: status | hold IDLE_S | release".into(),
+            _ => "error: status | hold IDLE_S | release | steer ALPHA".into(),
         }
+    }
+}
+
+/// The operator's steering command: `steer ALPHA` sets one global alpha (quiesce, apply, admit again)
+/// and `steer` reads the effective state back. The socket is mode 0600 and local: file access is the
+/// authorization, exactly as it is for `hold` and `release`. The alpha itself is validated in the
+/// engine (the accepted range lives there, model/steer.h); the front-end only refuses to send nonsense.
+pub async fn steer(engine: &EngineClient, gate: &Arc<Gate>, line: &str, timeout: Duration) -> String {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let set = match words.len() {
+        1 => None,
+        2 => match words[1].parse::<f32>() {
+            Ok(v) if v.is_finite() => Some(v),
+            _ => return format!("error: '{}' is not a finite number", words[1]),
+        },
+        _ => return "error: steer [ALPHA] (0.0 to 2.0)".into(),
+    };
+    if engine.info().is_none() {
+        return "error: the engine is not connected".into();
+    }
+    let Some(alpha) = set else {
+        return match engine.steer_get(timeout).await {
+            Ok(st) => steer_line(&st),
+            Err(e) => format!("error: {e}"),
+        };
+    };
+    let _guard = match gate.quiesce(timeout).await {
+        Ok(g) => g,
+        Err(e) => return format!("error: {e}"),
+    };
+    match engine.steer_set(alpha, timeout).await {
+        Ok(st) => steer_line(&st),
+        Err(e) => format!("error: {e}"),
+    }
+}
+
+/// One line: the effective value, its epoch, and every rank's read-back.
+fn steer_line(st: &SteerState) -> String {
+    let ranks: Vec<String> = st
+        .ranks
+        .iter()
+        .map(|r| {
+            if r.ok {
+                format!("{}:{}@{}{}", r.rank, r.alpha, r.epoch, if r.why.is_empty() { String::new() } else { format!("({})", r.why) })
+            } else {
+                format!("{}:refused({})", r.rank, r.why)
+            }
+        })
+        .collect();
+    if st.ok {
+        format!("ok steering={} alpha={} epoch={} ranks=[{}]", st.on, st.alpha, st.epoch, ranks.join(" "))
+    } else {
+        format!("error: {} alpha={} epoch={} ranks=[{}]", st.error, st.alpha, st.epoch, ranks.join(" "))
     }
 }
 
@@ -219,7 +330,15 @@ pub async fn admin(gate: Arc<Gate>, engine: EngineClient, path: PathBuf) -> std:
             let mut rd = BufReader::new(rd.take(256));
             let got = tokio::time::timeout(Duration::from_secs(5), rd.read_line(&mut line)).await;
             let reply = match got {
-                Ok(Ok(_)) => gate.command(line.trim(), engine.info().is_some()),
+                Ok(Ok(_)) => {
+                    let line = line.trim().to_string();
+                    if line == "steer" || line.starts_with("steer ") {
+                        // quiesce + engine round-trip: longer than a status line, and bounded
+                        steer(&engine, &gate, &line, Duration::from_secs(120)).await
+                    } else {
+                        gate.command(&line, engine.info().is_some())
+                    }
+                }
                 _ => "error: no command".into(),
             };
             let _ = wr.write_all(format!("{reply}\n").as_bytes()).await;
@@ -231,6 +350,43 @@ pub async fn admin(gate: Arc<Gate>, engine: EngineClient, path: PathBuf) -> std:
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn quiesce_drains_and_admits_again() {
+        let g = Gate::new(Duration::from_millis(300));
+        let on = || true;
+        // a request in flight: quiesce waits for it, and a new request waits meanwhile
+        let p = g.enter_when(on).await.unwrap();
+        let (g2, g3) = (g.clone(), g.clone());
+        let q = tokio::spawn(async move { g2.quiesce(Duration::from_secs(5)).await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(g3.status(true).starts_with("held 1"), "a steering change holds requests off");
+        assert!(!g3.open(true));
+        let new = tokio::spawn(async move { g3.enter_when(|| true).await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(!q.is_finished(), "quiesce waits for the request in flight");
+        drop(p); // the in-flight request finishes under the alpha it started with
+        assert_eq!(q.await.unwrap(), Ok(()));
+        // the guard dropped: admission is back, and the request that waited passes
+        let g4 = g.clone();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(g4.open(true));
+        assert_eq!(new.await.unwrap(), Ok(()));
+        assert!(!g.held());
+        // a drain that cannot finish in time refuses, and admits again
+        let p = g.enter_when(on).await.unwrap();
+        assert!(g.quiesce(Duration::from_millis(50)).await.is_err());
+        assert!(g.open(true), "a timed-out quiesce does not leave requests held off");
+        drop(p);
+        // and one at a time
+        let p = g.enter_when(on).await.unwrap();
+        let first = g.quiesce(Duration::from_secs(5));
+        tokio::pin!(first);
+        let other = g.quiesce(Duration::from_millis(10)).await;
+        assert!(other.is_err(), "a second steering change is refused while one runs");
+        drop(p);
+        assert!(first.await.is_ok());
+    }
 
     #[tokio::test]
     async fn passes_holds_and_refuses() {

@@ -26,7 +26,8 @@ fn usage() -> ! {
       --protocol-error-dir DIR  opt-in private raw bytes and token ids on parser errors only;\n                                also DSFRONT_PROTOCOL_ERROR_DIR (off by default, may contain sensitive text)
       --hold-s N                while the engine is down (the ring lent, or a restart), a request
                                 waits this long (600), then is answered 503 with Retry-After: 60
-      --admin-socket PATH       commands from service.sh (mode 600): status, hold IDLE_S, release
+      --admin-socket PATH       commands from service.sh (mode 600): status, hold IDLE_S, release,
+                                steer [ALPHA] (the global GLP steering alpha, docs/steering-control.md)
       --table-file PATH         the session table, saved here at a stop and taken back at the next
                                 start (mode 600, in a directory of mode 700; it holds the
                                 conversations' text), so that the engine's kept sessions are found again
@@ -222,7 +223,8 @@ fn admin(args: &[String]) {
         std::process::exit(2)
     };
     let mut s = std::os::unix::net::UnixStream::connect(&sock).unwrap_or_else(|e| fail(e));
-    s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap_or_else(|e| fail(e));
+    // steer may wait for a drain and an engine round-trip before it answers
+    s.set_read_timeout(Some(std::time::Duration::from_secs(180))).unwrap_or_else(|e| fail(e));
     writeln!(s, "{}", words.join(" ")).unwrap_or_else(|e| fail(e));
     let mut reply = String::new();
     s.read_to_string(&mut reply).unwrap_or_else(|e| fail(e));

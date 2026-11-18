@@ -11,6 +11,7 @@
 
 #include "comm/ring.h"
 #include "model/model.h"
+#include "model/steer.h"
 
 namespace srv {
 
@@ -68,7 +69,12 @@ enum : int32_t {
   // vision (docs/vision.md): n image spans for the prefill chunks that follow (Model::set_images; n = 0 clears
   // them); their bounds (int32 lo[n], hi[n]) and rows (bf16 [rows][5120]) follow as payloads
   kCmdImages = 21,
+  // steering (docs/steering-control.md): every rank applies one alpha for all traffic at this step
+  // boundary and reports what it holds (steer_sync). Rank 0 calls it too, in the same collectives order.
+  kCmdSteer = 22,
 };
+// kCmdSteer's flags
+enum : uint32_t { kSteerConfirm = 1 };  // read the state back; change nothing (STEER_GET)
 enum : uint32_t { kPfSample = 1, kPfCed = 2 };  // kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md)
 struct Cmd {
   int32_t op = kCmdStop;
@@ -109,7 +115,28 @@ struct Cmd {
   // kCmdDecode: the drafts' rate (SpecRate) to start from: a request decoded in slices goes on with the
   // last slice's (DecodeEnd::spec_tok, spec_ms)
   double spec_tok = 1, spec_ms = 0;
+  // kCmdSteer: the alpha to apply and the epoch every rank is expected to be at. Rank 0's rollback
+  // passes kSteerAnyEpoch (the ranks may have diverged; the value is restored, not compared).
+  float steer_alpha = 0.f;
+  uint64_t steer_epoch = 0;
 };
+
+// kCmdSteer's expectation when the epoch cannot be assumed: model::kSteerAnyEpoch (model/steer.h).
+
+// What one rank holds after a steering set, exchanged once per set (4 x ~120 bytes).
+struct SteerAck {
+  float alpha = 0.f;
+  uint64_t epoch = 0;
+  int32_t ok = 0;
+  int32_t rank = 0;
+  char why[96] = {};
+};
+
+// Rank 0 only: apply `alpha` on all four ranks at one step boundary and collect the confirmations
+// (all[4], by rank). Every rank's own refusal is in its ack; nothing here decides what is acceptable.
+void steer_broadcast(model::Model& m, comm::Ring& ring, float alpha, uint64_t epoch, SteerAck all[4]);
+// Rank 0 only: read every rank's effective state back, changing nothing.
+void steer_readback(model::Model& m, comm::Ring& ring, SteerAck all[4]);
 
 Cmd bcast(comm::Ring& ring, const Cmd& mine);
 // c's state operations, on every rank before c's own work, with the sessions c uses pinned in the

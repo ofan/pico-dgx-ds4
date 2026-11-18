@@ -157,13 +157,15 @@ Store& Model::Impl::store_of() {
 
 namespace {
 
-constexpr char kKeptMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'K', '1'};
+// 2: the header names the steering configuration the spilled state was computed under (steer.h).
+constexpr char kKeptMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'K', '2'};
 
 struct KeptHeader {
   char magic[8];
   uint64_t gen, run_id, file_bytes;
   int64_t written;  // unix time, seconds
   int32_t rank, n_sess;
+  uint64_t steer_id;  // the steering configuration (Model::steer.id()) the state was computed under
   uint64_t clock;                              // the store's
   uint64_t page_bytes, snap_bytes, end_bytes;  // its layout
   uint64_t body_bytes, body_hash;
@@ -192,6 +194,7 @@ uint64_t Model::Impl::state_kept_check(const std::string& base, uint64_t run_id,
   if (std::memcmp(hd.magic, kKeptMagic, sizeof kKeptMagic) != 0) return bad("not a kept index");
   if (hd.run_id != run_id) return bad("of another engine binary, weights or options");
   if (hd.rank != rank) return bad("of another rank");
+  if (hd.steer_id != steer.id()) return bad("spilled state computed under another steering configuration");
   if (age > max_age_s || age < -600) return bad("written " + std::to_string((long long)age) + " s ago");
   if (hd.page_bytes != kPageBytes || hd.snap_bytes != snap_bytes(sp) || hd.end_bytes != end_bytes(sp))
     return bad("of another layout");
@@ -318,6 +321,7 @@ void Model::Impl::state_keep(uint64_t gen) {
   std::memcpy(hd.magic, kKeptMagic, sizeof kKeptMagic);
   hd.gen = gen, hd.run_id = s.run_id, hd.file_bytes = s.disk->size(), hd.written = (int64_t)std::time(nullptr);
   hd.rank = rank, hd.n_sess = n, hd.clock = s.clock;
+  hd.steer_id = steer.id();
   hd.page_bytes = kPageBytes, hd.snap_bytes = snap_bytes(sp), hd.end_bytes = end_bytes(sp);
   hd.body_bytes = f.size() - sizeof hd;
   hd.body_hash = keepfile::fnv(f.data() + sizeof hd, hd.body_bytes);

@@ -1,5 +1,5 @@
 add_library(dsmodel STATIC model.cu ops.cu fused.cu sample.cu prefill.cu state.cu spec.cu wave_probe.cu spill.cpp
-  glp.cpp glp.cu)
+  glp.cpp glp.cu steer.cpp)
 target_include_directories(dsmodel PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(dsmodel PUBLIC dsattn dsk_kernels dsgb10_comm engram dsw_loader dspark)
 
@@ -11,6 +11,11 @@ target_link_libraries(coll_tests dsmodel)
 # GGUF file's metadata, the fail-closed refusals, and glp_project_row against a reference fold.
 add_executable(glp_test tests/glp_test.cpp glp.cpp)
 target_include_directories(glp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Runtime steering control (steer.h): the strict alpha parser, the accepted range, the configuration
+# identity and the epoch machine. Host only, no GPU.
+add_executable(steer_test tests/steer_test.cpp steer.cpp)
+target_include_directories(steer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Host-only recorded-Owen v1 fold/reduction-order regression (real direction file argument).
 add_executable(glp_math_test tests/glp_math_test.cpp glp.cpp)

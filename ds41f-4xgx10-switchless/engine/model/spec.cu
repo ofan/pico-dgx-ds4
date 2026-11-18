@@ -1014,6 +1014,16 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
 // The step graphs of every context now (serve's startup): the device memory a graph takes (its conditional
 // bodies live on the device) would otherwise have to be free in the middle of a session. One graph serves
 // every context (scan_ctx), so the sweep captures one. With session slots, the batch step's graphs too.
+void Model::Impl::spec_drop_graphs() {
+  if (!spec) return;
+  const size_t n = spec->graphs.size() + spec->bgraphs.size();
+  for (auto& g : spec->graphs) CUDA_CHECK(cudaGraphExecDestroy(g.second));
+  for (auto& g : spec->bgraphs) CUDA_CHECK(cudaGraphExecDestroy(g.second));
+  spec->graphs.clear();
+  spec->bgraphs.clear();
+  if (rank == 0 && n) std::printf("spec: %zu step graph(s) dropped\n", n);
+}
+
 void Model::Impl::spec_graphs() {
   if (!spec) die("model: spec_graphs without bind_spec");
   const clock_t t0 = clock();

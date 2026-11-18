@@ -4,7 +4,7 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3; // 3: STEER_SET / STEER_GET / STEER_STATE (docs/steering-control.md)
 pub const DEFAULT_SOCKET: &str = "/tmp/dsgb10-engine.sock";
 /// Larger frames are a protocol error (a 1M-token prompt is 4 MB).
 pub const MAX_FRAME: usize = 192 << 20;
@@ -13,9 +13,12 @@ pub const T_HELLO: u16 = 0x01;
 pub const T_SUBMIT: u16 = 0x02;
 pub const T_CANCEL: u16 = 0x03;
 pub const T_RELEASE: u16 = 0x04;
+pub const T_STEER_SET: u16 = 0x05;
+pub const T_STEER_GET: u16 = 0x06;
 pub const T_HELLO_ENGINE: u16 = 0x81;
 pub const T_TOKENS: u16 = 0x82;
 pub const T_DONE: u16 = 0x83;
+pub const T_STEER_STATE: u16 = 0x84;
 
 pub const FLAG_SEED: u32 = 1;
 pub const FLAG_KEEP: u32 = 2;
@@ -98,6 +101,28 @@ pub struct Done {
     pub error: String,
 }
 
+/// One rank's confirmation of a steering set (STEER_STATE).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SteerRank {
+    pub rank: u32,
+    pub alpha: f32,
+    pub epoch: u64,
+    pub ok: bool,
+    pub why: String,
+}
+
+/// The answer to a STEER_SET or STEER_GET: the effective state after it, and every rank's view.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SteerState {
+    pub req_id: u64,
+    pub epoch: u64,
+    pub alpha: f32,
+    pub on: bool,
+    pub ok: bool,
+    pub ranks: Vec<SteerRank>,
+    pub error: String,
+}
+
 /// A decoded frame, either direction.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Frame {
@@ -105,9 +130,12 @@ pub enum Frame {
     Submit(Submit),
     Cancel { req_id: u64 },
     Release { session_id: u64 },
+    SteerSet { req_id: u64, alpha: f32 },
+    SteerGet { req_id: u64 },
     HelloEngine(HelloEngine),
     Tokens(Tokens),
     Done(Done),
+    SteerState(SteerState),
 }
 
 // ------------------------------------------------------------------ encoding
@@ -178,6 +206,16 @@ impl Frame {
                 w.u64(*session_id);
                 w.finish()
             }
+            Frame::SteerSet { req_id, alpha } => {
+                let mut w = W::new(T_STEER_SET);
+                w.u64(*req_id).f32(*alpha).u32(0);
+                w.finish()
+            }
+            Frame::SteerGet { req_id } => {
+                let mut w = W::new(T_STEER_GET);
+                w.u64(*req_id);
+                w.finish()
+            }
             Frame::HelloEngine(h) => {
                 let mut w = W::new(T_HELLO_ENGINE);
                 w.u32(h.version).u32(h.max_context).u32(h.vocab_size).u32(h.eos_id).u32(h.max_sessions);
@@ -199,6 +237,21 @@ impl Frame {
                         w.u32(*id).f32(*lp);
                     }
                 }
+                w.finish()
+            }
+            Frame::SteerState(st) => {
+                let mut w = W::new(T_STEER_STATE);
+                w.u64(st.req_id).u64(st.epoch).f32(st.alpha).u32(st.on as u32).u32(st.ranks.len() as u32);
+                w.u32(st.ok as u32).u32(st.error.len() as u32).u32(0);
+                for r in &st.ranks {
+                    w.u64(r.epoch).f32(r.alpha).u32(r.rank).u32(r.ok as u32);
+                    let mut why = [0u8; 96];
+                    let n = r.why.len().min(95);
+                    why[..n].copy_from_slice(&r.why.as_bytes()[..n]);
+                    w.0.extend_from_slice(&why);
+                    w.u32(0);
+                }
+                w.0.extend_from_slice(st.error.as_bytes());
                 w.finish()
             }
             Frame::Done(d) => {
@@ -288,6 +341,36 @@ impl Frame {
             }
             T_CANCEL => Frame::Cancel { req_id: r.u64()? },
             T_RELEASE => Frame::Release { session_id: r.u64()? },
+            T_STEER_SET => {
+                let req_id = r.u64()?;
+                let alpha = r.f32()?;
+                if r.u32()? != 0 { return Err("STEER_SET reserved is not 0".into()); }
+                Frame::SteerSet { req_id, alpha }
+            }
+            T_STEER_GET => Frame::SteerGet { req_id: r.u64()? },
+            T_STEER_STATE => {
+                let req_id = r.u64()?;
+                let epoch = r.u64()?;
+                let alpha = r.f32()?;
+                let on = r.u32()? != 0;
+                let n_ranks = r.u32()? as usize;
+                let ok = r.u32()? != 0;
+                let error_len = r.u32()? as usize;
+                if r.u32()? != 0 { return Err("STEER_STATE reserved is not 0".into()); }
+                if n_ranks > 8 || error_len > 4096 { return Err("invalid STEER_STATE limits".into()); }
+                let mut ranks = Vec::with_capacity(n_ranks);
+                for _ in 0..n_ranks {
+                    let repoch = r.u64()?;
+                    let ralpha = r.f32()?;
+                    let rank = r.u32()?;
+                    let rok = r.u32()? != 0;
+                    let why = cstr(r.bytes(96)?);
+                    r.u32()?; // pad
+                    ranks.push(SteerRank { rank, alpha: ralpha, epoch: repoch, ok: rok, why });
+                }
+                let error = String::from_utf8_lossy(r.bytes(error_len)?).into_owned();
+                Frame::SteerState(SteerState { req_id, epoch, alpha, on, ok, ranks, error })
+            }
             T_HELLO_ENGINE => {
                 let version = r.u32()?;
                 let max_context = r.u32()?;
@@ -333,6 +416,12 @@ impl Frame {
         }
         Ok(f)
     }
+}
+
+/// A fixed-width, NUL-terminated string field.
+fn cstr(b: &[u8]) -> String {
+    let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    String::from_utf8_lossy(&b[..n]).into_owned()
 }
 
 struct R<'a> {
@@ -421,6 +510,53 @@ mod tests {
         }
         let mut s = image_submit(); s.images.as_mut().unwrap()[4..8].copy_from_slice(&u32::MAX.to_le_bytes()); assert!(dec(s).is_err());
     }
+    #[test]
+    fn steering_frames_roundtrip() {
+        let b = Frame::SteerSet { req_id: 3, alpha: 0.75 }.encode();
+        assert_eq!(b.len(), 8 + 16); // header, req_id + alpha + reserved
+        assert_eq!(Frame::decode(T_STEER_SET, &b[8..], |_| 0).unwrap(), Frame::SteerSet { req_id: 3, alpha: 0.75 });
+        let b = Frame::SteerGet { req_id: 4 }.encode();
+        assert_eq!(Frame::decode(T_STEER_GET, &b[8..], |_| 0).unwrap(), Frame::SteerGet { req_id: 4 });
+
+        let st = SteerState {
+            req_id: 5,
+            epoch: 2,
+            alpha: 1.0,
+            on: true,
+            ok: true,
+            ranks: (0..4)
+                .map(|r| SteerRank { rank: r, alpha: 1.0, epoch: 2, ok: true, why: String::new() })
+                .collect(),
+            error: String::new(),
+        };
+        let b = Frame::SteerState(st.clone()).encode();
+        assert_eq!(b.len(), 8 + 40 + 4 * 120);
+        assert_eq!(Frame::decode(T_STEER_STATE, &b[8..], |_| 0).unwrap(), Frame::SteerState(st));
+
+        // a refusal: the error text and a per-rank reason survive, and the exact byte count matters
+        let mut st = SteerState {
+            req_id: 6,
+            epoch: 0,
+            alpha: 0.75,
+            on: true,
+            ok: false,
+            ranks: (0..4)
+                .map(|r| SteerRank { rank: r, alpha: 0.75, epoch: 0, ok: r < 3, why: if r < 3 { String::new() } else { "a step is in flight".into() } })
+                .collect(),
+            error: "rank 3: a step is in flight".into(),
+        };
+        let b = Frame::SteerState(st.clone()).encode();
+        assert_eq!(Frame::decode(T_STEER_STATE, &b[8..], |_| 0).unwrap(), Frame::SteerState(st.clone()));
+        st.error.push('x');
+        let b = Frame::SteerState(st).encode();
+        assert!(Frame::decode(T_STEER_STATE, &b[8..], |_| 0).is_ok());
+        // a reserved word that is not 0 is refused, not reinterpreted
+        let mut b = Frame::SteerSet { req_id: 1, alpha: 0.5 }.encode();
+        let n = b.len();
+        b[n - 4..].copy_from_slice(&7u32.to_le_bytes());
+        assert!(Frame::decode(T_STEER_SET, &b[8..], |_| 0).is_err());
+    }
+
     #[test]
     fn roundtrip_and_layout() {
         let s = Submit {
