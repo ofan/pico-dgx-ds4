@@ -360,6 +360,7 @@ fn enccheck(args: &[String]) {
                 let got = encode_messages(&msgs, &o);
                 match (got, c.get("prompt")) {
                     (Ok((p, imgs)), Some(Value::String(want))) => {
+                        let p = p.text.clone();
                         if &p != want {
                             let k = p.chars().zip(want.chars()).position(|(a, b)| a != b).unwrap_or(p.len().min(want.len()));
                             let at = |s: &str| s.chars().skip(k.saturating_sub(20)).take(60).collect::<String>();

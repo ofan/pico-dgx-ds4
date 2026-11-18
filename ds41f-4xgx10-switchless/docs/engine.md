@@ -2333,6 +2333,35 @@ frontend/tools/fe_bench.py http://127.0.0.1:PORT KEYFILE  # against the mock eng
 The case generators and check_against_sglang.py run in the kit's canary-roce image; each one's
 header gives its command.
 
+#### Special-token literals in message text (2026-11-18)
+
+A request whose text *mentions* a DeepSeek special token — pasting this engine's own source is the
+common case — used to be refused outright: `cannot encode messages: Message content contains image
+special token '<｜deepseek_image｜>'` (`encoding.rs`, `validate_no_image_sp_tokens`, plus the same check
+on text blocks in `process_image_blocks`). Every other stack treats the literal as ordinary text, so a
+conversation that had absorbed one could never be served by this engine again.
+
+The renderer now records which bytes it wrote as *template structure* (`encoding::Prompt`: role markers,
+think tags, DSML scaffolding, task tokens, and the placeholder of a real image block), and the tokeniser
+cuts added tokens out only inside those ranges (`Tokenizer::encode_masked`,
+`Tokenizer::encode_parallel_masked`). Message text — user, assistant and tool content, tool schemas,
+arguments, response formats — is BPE over its own bytes, so a special-token literal is spelled out like
+any other text: it cannot forge a turn marker and cannot be counted as an image placeholder. The image
+block's placeholder is emitted as its own block (`{"type": "image_placeholder"}`), so it stays structure
+while a text block that reads the same string does not.
+
+- The rendered prompt is unchanged byte for byte; only the ids it becomes differ. The one deliberate
+  divergence from the publisher's encoding.py is `enccheck`'s `placeholder_in_text_*`,
+  `placeholder_in_block_*` and `tool_placeholder_*` cases: the reference raises, this port renders the
+  literal as text.
+- Prefix reuse: `SessionTable::plan` takes the prompt's structural spans, and a reused prefix is cut
+  only at a structural edge.
+- Tests: `encoding::tests::special_token_literals_in_text_are_plain_text`,
+  `real_image_block_still_yields_one_placeholder`, `masked_parallel_encoding_matches_the_single_pass`,
+  `server::tests::special_token_literals_prepare_like_any_other_text`, and
+  `session::tests::reuse_over_special_token_literals_in_text` (the last four run against a small
+  synthetic tokeniser, so they do not need the checkpoint).
+
 #### Against the kit with its own benchmark (sparkDash 1.8.8, 2026-10-12)
 
 **Verdict: the engine leads the published SGLang kit on every comparison.** The comparison uses the

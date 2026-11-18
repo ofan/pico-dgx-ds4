@@ -263,8 +263,10 @@ impl SessionTable {
     }
 
     /// Choose the session and the token ids for a prompt. The chosen session is busy until
-    /// `finish` or `abandon`. Returns the plan and the sessions to RELEASE on the engine.
-    pub fn plan(&mut self, text: &str, tok: &Tokenizer, threads: usize) -> (Plan, Vec<u64>) {
+    /// `finish` or `abandon`. `structural` is the prompt's template structure (see `encoding::Prompt`):
+    /// only there may a cut sit beside an added token, because message text is tokenised as plain
+    /// text. Returns the plan and the sessions to RELEASE on the engine.
+    pub fn plan(&mut self, text: &str, structural: &[(usize, usize)], tok: &Tokenizer, threads: usize) -> (Plan, Vec<u64>) {
         self.clock += 1;
         let mut top: Option<(u64, usize)> = None;
         for (&id, s) in &self.sessions {
@@ -284,7 +286,7 @@ impl SessionTable {
                 // The last cut point within the shared text that is a token boundary of the session
                 // and an edge of an added token in the new text.
                 let mut cut = (0, 0); // (byte position, ids before it)
-                for (a, e) in tok.added_spans(text) {
+                for &(a, e) in structural {
                     if a > shared {
                         break;
                     }
@@ -306,7 +308,8 @@ impl SessionTable {
                 (plan, cut.0)
             }
         };
-        plan.ids.extend(tok.encode_parallel(&text[cut..], threads));
+        let rest: Vec<(usize, usize)> = structural.iter().filter(|&&(a, _)| a >= cut).map(|&(a, e)| (a - cut, e - cut)).collect();
+        plan.ids.extend(tok.encode_parallel_masked(&text[cut..], &rest, threads));
         if let Some((sid, n)) = top {
             plan.matched = sid;
             plan.shared = n;
@@ -397,14 +400,14 @@ mod tests {
         let mut t = SessionTable::new(8, 1 << 20);
         let sys = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.";
         let p1 = format!("{sys}<｜User｜>hello<｜Assistant｜></think>");
-        let (plan, _) = t.plan(&p1, &tok, 1);
+        let (plan, _) = t.plan(&p1, &crate::encoding::test_spans(&p1), &tok, 1);
         assert_eq!(plan.ids, tok.encode(&p1));
         // the model spelled "Hi there" in single letters, which BPE would never produce
         let mut gen: Vec<u32> = "Hi there".chars().map(|c| tok.encode(&c.to_string())[0]).collect();
         gen.push(tok.token_id("<｜end▁of▁sentence｜>").unwrap());
         t.finish(plan.session_id, &p1, &plan.ids, &gen, &tok);
         let p2 = format!("{p1}Hi there<｜end▁of▁sentence｜><｜User｜>next<｜Assistant｜></think>");
-        let (plan2, _) = t.plan(&p2, &tok, 1);
+        let (plan2, _) = t.plan(&p2, &crate::encoding::test_spans(&p2), &tok, 1);
         assert_eq!(plan2.session_id, plan.session_id);
         let mut want = plan.ids.clone();
         want.extend(&gen);
@@ -414,7 +417,7 @@ mod tests {
         assert_eq!(tok.decode(&plan2.ids), p2);
         // the same system prompt in another conversation forks instead of taking over the session
         let p3 = format!("{sys}<｜User｜>something else entirely<｜Assistant｜></think>");
-        let (plan3, _) = t.plan(&p3, &tok, 1);
+        let (plan3, _) = t.plan(&p3, &crate::encoding::test_spans(&p3), &tok, 1);
         assert_ne!(plan3.session_id, plan.session_id);
         assert_eq!(plan3.base_session_id, plan.session_id);
         assert_eq!(tok.decode(&plan3.ids), p3);
@@ -430,12 +433,12 @@ mod tests {
             format!("<｜begin▁of▁sentence｜><｜System｜>{body}Current date and time: Monday, October 12, 2026 at {time}\n\n## Tools\n\nnone<｜User｜>{msg}<｜Assistant｜></think>")
         };
         let a = conv("09:14:08 AM", "fix the build");
-        let (pa, _) = t.plan(&a, &tok, 1);
+        let (pa, _) = t.plan(&a, &crate::encoding::test_spans(&a), &tok, 1);
         assert_eq!(pa.describe(a.len()), format!("session {}, new: no session shares a byte", pa.session_id));
         t.finish(pa.session_id, &a, &pa.ids, &tok.encode("Done."), &tok);
         // another conversation, a minute later: a fork of the first, which has every id before the time
         let b = conv("09:15:31 AM", "write the tests");
-        let (pb, _) = t.plan(&b, &tok, 1);
+        let (pb, _) = t.plan(&b, &crate::encoding::test_spans(&b), &tok, 1);
         assert_eq!(pb.base_session_id, pa.session_id);
         assert_eq!(pb.ids, tok.encode(&b), "the ids are a cold run's");
         let head = tok.encode(&b[..b.find("09:15").unwrap()]).len();
@@ -445,19 +448,53 @@ mod tests {
         assert!(d.ends_with(&format!("of {} bytes, {} ids in common", b.len(), pb.common)), "{d}");
         // the next turn of the first: in place
         let a2 = format!("{a}Done.<｜end▁of▁sentence｜><｜User｜>thanks<｜Assistant｜></think>");
-        let (pa2, _) = t.plan(&a2, &tok, 1);
+        let (pa2, _) = t.plan(&a2, &crate::encoding::test_spans(&a2), &tok, 1);
         assert_eq!(pa2.session_id, pa.session_id);
         assert!(pa2.describe(a2.len()).starts_with(&format!("session {} in place: it shares ", pa.session_id)));
         t.finish(pa2.session_id, &a2, &pa2.ids, &tok.encode("Sure."), &tok);
         // a prompt that shares only the BOS and a few bytes: a new session, which names no base
         let c = "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>";
-        let (pc, _) = t.plan(c, &tok, 1);
+        let (pc, _) = t.plan(c, &crate::encoding::test_spans(c), &tok, 1);
         assert_eq!(pc.base_session_id, 0);
         let n = common_prefix(c.as_bytes(), a.as_bytes());
         assert!(n > 0 && n < MIN_SHARED);
         let d = pc.describe(c.len());
         assert!(d.starts_with(&format!("session {}, new: the best match, session ", pc.session_id)), "{d}");
         assert!(d.ends_with(&format!(", shares {n} bytes (under 64)")), "{d}");
+    }
+
+    /// Prefix reuse over prompts whose text carries special-token literals: the rendered prompt and
+    /// its structural spans go in as they are, and a second turn of the same conversation is served
+    /// from the first's ids.
+    #[test]
+    fn reuse_over_special_token_literals_in_text() {
+        let tok = crate::encoding::mini_tokenizer();
+        let mut t = SessionTable::new(8, 1 << 20);
+        let msgs = |tail: &str| -> Vec<serde_json::Value> {
+            serde_json::from_str(&format!(
+                r#"[{{"role":"system","content":"you read engine source"}},
+                    {{"role":"user","content":"it prints <｜deepseek_image｜> and <｜User｜> {tail}"}},
+                    {{"role":"assistant","content":"ok <｜end▁of▁sentence｜>"}}]"#
+            ))
+            .unwrap()
+        };
+        let mut o = crate::encoding::EncodeOptions::new(crate::encoding::ThinkingMode::Chat);
+        let (p1, imgs) = crate::encoding::encode_messages(&msgs("first"), &o).unwrap();
+        assert!(imgs.is_empty());
+        let (plan, _) = t.plan(&p1.text, &p1.structural, &tok, 1);
+        assert_eq!(plan.ids, tok.encode_masked(&p1.text, &p1.structural));
+        let gen = tok.encode("done");
+        t.finish(plan.session_id, &p1.text, &plan.ids, &gen, &tok);
+        o.drop_thinking = true;
+        let (p2, _) = crate::encoding::encode_messages(&msgs("second"), &o).unwrap();
+        let (plan2, _) = t.plan(&p2.text, &p2.structural, &tok, 1);
+        assert!(
+            plan2.session_id == plan.session_id || plan2.base_session_id == plan.session_id,
+            "the second turn is served from the first's session"
+        );
+        assert!(plan2.reused > 0 && plan2.reused <= plan.ids.len() + gen.len());
+        assert_eq!(plan2.ids, tok.encode_masked(&p2.text, &p2.structural));
+        assert_eq!(tok.decode(&plan2.ids), p2.text, "the literals come back as text");
     }
 
     #[test]
@@ -469,10 +506,10 @@ mod tests {
         let path = dir.join("front.table");
         let mut t = SessionTable::new(8, 1 << 20);
         let p1 = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.<｜User｜>hello<｜Assistant｜></think>";
-        let (plan, _) = t.plan(p1, &tok, 1);
+        let (plan, _) = t.plan(p1, &crate::encoding::test_spans(p1), &tok, 1);
         let gen = tok.encode("Hi there.");
         t.finish(plan.session_id, p1, &plan.ids, &gen, &tok);
-        let (busy, _) = t.plan("<｜begin▁of▁sentence｜><｜System｜>Another conversation, still in its request, which is not saved.", &tok, 1);
+        let (busy, _) = t.plan("<｜begin▁of▁sentence｜><｜System｜>Another conversation, still in its request, which is not saved.", &crate::encoding::test_spans("<｜begin▁of▁sentence｜><｜System｜>Another conversation, still in its request, which is not saved."), &tok, 1);
         let repo = dir.join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::create_dir(repo.join("run")).unwrap();
@@ -489,7 +526,7 @@ mod tests {
         assert!(!path.exists(), "the file goes once read");
         assert!(u.next_id > busy.session_id, "ids go on after the saved table's");
         let p2 = format!("{p1}Hi there.<｜User｜>next<｜Assistant｜></think>");
-        let (plan2, _) = u.plan(&p2, &tok, 1);
+        let (plan2, _) = u.plan(&p2, &crate::encoding::test_spans(&p2), &tok, 1);
         assert_eq!(plan2.session_id, plan.session_id);
         assert_eq!(plan2.reused, plan.ids.len() + gen.len());
         assert_eq!(tok.decode(&plan2.ids), p2);

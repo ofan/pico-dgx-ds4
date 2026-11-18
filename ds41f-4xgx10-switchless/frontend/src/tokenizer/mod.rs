@@ -336,6 +336,95 @@ impl Tokenizer {
         self.added_raw.split(text, &mut plain, &mut |id| out_cell.borrow_mut().push(id));
     }
 
+    /// Encode as ordinary text: no added-token cut, so a special-token literal is spelled out in
+    /// byte-level pieces like any other text.
+    fn encode_plain(&self, text: &str, cache: &mut Cache, out: &mut Vec<u32>) {
+        pretokenize(text, &mut |piece| self.bpe_piece(piece.as_bytes(), cache, out));
+    }
+
+    /// Encode `text` cutting added tokens out only inside `structural`, the byte ranges the chat
+    /// template wrote as structure (role markers, think tags, DSML scaffolding, image placeholders).
+    /// Text outside those ranges is message content: a special-token literal there is ordinary text
+    /// and never becomes a special id. Ranges must be sorted, non-overlapping and on char boundaries.
+    pub fn encode_masked(&self, text: &str, structural: &[(usize, usize)]) -> Vec<u32> {
+        let mut cache = Cache::default();
+        let mut out = Vec::with_capacity(text.len() / 3 + 16);
+        self.encode_masked_with(text, structural, &mut cache, &mut out);
+        out
+    }
+
+    /// `encode_masked` with a caller-owned cache, appending to `out`.
+    pub fn encode_masked_with(&self, text: &str, structural: &[(usize, usize)], cache: &mut Cache, out: &mut Vec<u32>) {
+        let mut pos = 0usize;
+        for &(a, e) in structural {
+            let (a, e) = (a.min(text.len()), e.min(text.len()));
+            if a < pos || e <= a || !text.is_char_boundary(a) || !text.is_char_boundary(e) {
+                continue;
+            }
+            if a > pos {
+                self.encode_plain(&text[pos..a], cache, out);
+            }
+            self.encode_with(&text[a..e], cache, out);
+            pos = e;
+        }
+        if pos < text.len() {
+            self.encode_plain(&text[pos..], cache, out);
+        }
+    }
+
+    /// `encode_parallel` for a masked prompt: an added token may only span a cut inside a
+    /// structural range, and cuts never fall inside one.
+    pub fn encode_parallel_masked(&self, text: &str, structural: &[(usize, usize)], threads: usize) -> Vec<u32> {
+        const CHUNK: usize = 1 << 16;
+        if text.len() < 2 * CHUNK || threads <= 1 {
+            return self.encode_masked(text, structural);
+        }
+        let target = (text.len() / threads).max(CHUNK);
+        let b = text.as_bytes();
+        let mut cuts = vec![0usize];
+        let mut pos = target;
+        while pos < b.len() {
+            let mut i = pos;
+            let mut found = None;
+            while i + 1 < b.len() {
+                if b[i] == b'\n' {
+                    let nb = b[i + 1];
+                    let ws = matches!(nb, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) || nb >= 0x80;
+                    if !ws && cut_is_safe_masked(structural, i + 1) {
+                        found = Some(i + 1);
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            match found {
+                Some(c) => {
+                    cuts.push(c);
+                    pos = c + target;
+                }
+                None => break,
+            }
+        }
+        cuts.push(b.len());
+        let mut parts: Vec<Vec<u32>> = vec![Vec::new(); cuts.len() - 1];
+        std::thread::scope(|sc| {
+            for (k, part) in parts.iter_mut().enumerate() {
+                let (start, end) = (cuts[k], cuts[k + 1]);
+                let seg = &text[start..end];
+                let ranges: Vec<(usize, usize)> = structural
+                    .iter()
+                    .filter(|&&(a, e)| a >= start && e <= end)
+                    .map(|&(a, e)| (a - start, e - start))
+                    .collect();
+                sc.spawn(move || {
+                    let mut cache = Cache::default();
+                    self.encode_masked_with(seg, &ranges, &mut cache, part);
+                });
+            }
+        });
+        parts.concat()
+    }
+
     /// Encode a long text on several threads. Cuts only where a piece boundary is certain:
     /// after a newline that is followed by a non-whitespace char.
     pub fn encode_parallel(&self, text: &str, threads: usize) -> Vec<u32> {
@@ -533,6 +622,11 @@ impl Tokenizer {
     pub fn decode(&self, ids: &[u32]) -> String {
         String::from_utf8_lossy(&self.decode_bytes(ids)).into_owned()
     }
+}
+
+/// A cut outside every structural range, where a structural added token cannot span it.
+fn cut_is_safe_masked(structural: &[(usize, usize)], cut: usize) -> bool {
+    structural.iter().all(|&(a, e)| !(a < cut && cut < e))
 }
 
 /// Incremental decoder: feed ids, get text as soon as the bytes form complete UTF-8 characters.

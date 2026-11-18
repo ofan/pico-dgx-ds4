@@ -206,6 +206,9 @@ async fn models(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
 /// What the request asks for, with the prompt rendered.
 pub struct Prepared {
     pub prompt: String,
+    /// The prompt's template structure (see `encoding::Prompt`): the only bytes an added token may
+    /// be cut from when the prompt is tokenised.
+    pub structural: Vec<(usize, usize)>,
     pub mode: ThinkingMode,
     pub tools: bool,
     pub stream: bool,
@@ -406,6 +409,8 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
     o.reasoning_effort = Some(&budget);
     o.encoding = cfg.encoding;
     let (prompt, images) = encode_messages(&messages, &o).map_err(|e| format!("cannot encode messages: {e}"))?;
+    let structural = prompt.structural.clone();
+    let prompt = prompt.text;
     if images.len() > crate::vision::MAX_IMAGES {
         return Err(format!("at most {} images per request", crate::vision::MAX_IMAGES));
     }
@@ -445,6 +450,7 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
     let include_usage = truthy(r.get("stream_options").and_then(|s| s.get("include_usage")));
     Ok(Prepared {
         prompt,
+        structural,
         mode,
         tools: !tools.is_empty(),
         stream,
@@ -725,9 +731,10 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
     let (plan, released) = {
         let app2 = app.clone();
         let text = p.prompt.clone();
+        let structural = p.structural.clone();
         tokio::task::spawn_blocking(move || {
             let mut t = app2.sessions.lock().unwrap();
-            t.plan(&text, &app2.tok, app2.cfg.tokenize_threads)
+            t.plan(&text, &structural, &app2.tok, app2.cfg.tokenize_threads)
         })
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
@@ -812,7 +819,8 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
     })?;
     let ids = {
         let (app2, text) = (app.clone(), p.prompt.clone());
-        tokio::task::spawn_blocking(move || app2.tok.encode_parallel(&text, app2.cfg.tokenize_threads))
+        let structural = p.structural.clone();
+        tokio::task::spawn_blocking(move || app2.tok.encode_parallel_masked(&text, &structural, app2.cfg.tokenize_threads))
             .await
             .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
     };
@@ -1043,6 +1051,7 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::{ASSISTANT_SP, BOS, EOS, IMAGE_PLACEHOLDER, LATEST_REMINDER_SP, SYSTEM_SP, THINK_END, THINK_START, USER_SP};
 
     fn cfg() -> ServerConfig {
         ServerConfig {
@@ -1116,6 +1125,25 @@ mod tests {
         ] {
             assert_eq!(effort_budget(Some(&v), 75), want, "{v}");
         }
+    }
+
+    /// The same literals through `prepare`, the HTTP request's way in.
+    #[test]
+    fn special_token_literals_prepare_like_any_other_text() {
+        let req: Value = json!({"chat_template_kwargs": {"thinking": true}, "messages": [
+            {"role": "user", "content": format!("engine source: {IMAGE_PLACEHOLDER} {USER_SP} {EOS}")},
+            {"role": "user", "content": [{"type": "text", "text": format!("{IMAGE_PLACEHOLDER}")}]},
+            {"role": "assistant", "content": "ok", "reasoning_content": format!("{THINK_END}{IMAGE_PLACEHOLDER}")}
+        ]});
+        let p = prepare(&cfg(), &req).unwrap();
+        assert!(p.images.is_empty());
+        assert_eq!(p.prompt.matches(IMAGE_PLACEHOLDER).count(), 3, "all three literals survive as text");
+        let markers = [BOS, EOS, THINK_START, THINK_END, USER_SP, ASSISTANT_SP, SYSTEM_SP, LATEST_REMINDER_SP];
+        for &(a, e) in &p.structural {
+            let s = &p.prompt[a..e];
+            assert!(markers.contains(&s) || s.starts_with("Reasoning Effort: "), "a span is not template structure: {s:?}");
+        }
+        assert!(p.structural.iter().any(|&(a, e)| &p.prompt[a..e] == USER_SP));
     }
 
     #[test]

@@ -459,7 +459,9 @@ fn process_image_blocks(blocks: &[Value]) -> Result<(Vec<Value>, Vec<Value>), En
             continue;
         }
         if is_image_block(block) {
-            new_blocks.push(json!({"type": "text", "text": IMAGE_PLACEHOLDER}));
+            // A placeholder block, not a text block: it is the template's mark for a real image and
+            // is rendered as structure. Message text never becomes one (it would need an image block).
+            new_blocks.push(json!({"type": "image_placeholder"}));
             images.push(extract_image(block)?);
         } else if get_str(block, "type") == Some("tool_result") && get(block, "content").map_or(false, Value::is_array) {
             let mut b = block.clone();
@@ -469,32 +471,13 @@ fn process_image_blocks(blocks: &[Value]) -> Result<(Vec<Value>, Vec<Value>), En
             new_blocks.push(b);
             images.extend(nested);
         } else if get_str(block, "type") == Some("text") {
-            let text = or_empty(get(block, "text"));
-            if text.contains(IMAGE_PLACEHOLDER) {
-                return Err(err(format!(
-                    "Text block contains image placeholder '{IMAGE_PLACEHOLDER}'. Images should be separate content blocks."
-                )));
-            }
+            // Text is text: a placeholder literal in it is ordinary content, not an image.
             new_blocks.push(block.clone());
         } else {
             new_blocks.push(block.clone());
         }
     }
     Ok((new_blocks, images))
-}
-
-fn validate_no_image_sp_tokens(msg: &Value) -> Result<(), EncodeError> {
-    if let Some(Value::String(c)) = get(msg, "content") {
-        if c.contains(IMAGE_PLACEHOLDER) {
-            return Err(err(format!("Message content contains image special token '{IMAGE_PLACEHOLDER}'.")));
-        }
-    }
-    if let Some(Value::String(c)) = get(msg, "reasoning_content") {
-        if c.contains(IMAGE_PLACEHOLDER) {
-            return Err(err(format!("reasoning_content contains image special token '{IMAGE_PLACEHOLDER}'")));
-        }
-    }
-    Ok(())
 }
 
 /// encoding.py process_image_messages: list content becomes content_blocks, images become placeholders.
@@ -506,7 +489,6 @@ pub fn process_image_messages(messages: &[Value]) -> Result<(Vec<Value>, Vec<Val
         if !msg.is_object() {
             return Err(err("message must be an object"));
         }
-        validate_no_image_sp_tokens(&msg)?;
         if get(&msg, "content").map_or(false, Value::is_array) && get(&msg, "content_blocks").is_none() {
             let c = obj_mut(&mut msg).shift_remove("content").unwrap();
             obj_mut(&mut msg).insert("content_blocks".into(), c);
@@ -534,6 +516,120 @@ pub fn process_image_messages(messages: &[Value]) -> Result<(Vec<Value>, Vec<Val
         processed.push(msg);
     }
     Ok((processed, images))
+}
+
+/// Test helper (and the fixture behind the shared-tokenizer tests): a tokeniser shaped like the
+/// checkpoint's: byte-level BPE, no merges, and the DeepSeek special tokens as added tokens — so an
+/// unmasked encode would cut them out of any text.
+#[cfg(test)]
+pub fn mini_tokenizer() -> crate::tokenizer::Tokenizer {
+    let b2u = crate::tokenizer::bytes_to_unicode();
+    let mut vocab = serde_json::Map::new();
+    for (b, c) in b2u.iter().enumerate() {
+        vocab.insert(c.to_string(), json!(b));
+    }
+    let added: Vec<Value> = [
+        BOS,
+        EOS,
+        USER_SP,
+        ASSISTANT_SP,
+        SYSTEM_SP,
+        LATEST_REMINDER_SP,
+        IMAGE_PLACEHOLDER,
+        THINK_START,
+        THINK_END,
+        "<｜DSML｜ invoke name=\"x\">",
+        "<｜action｜>",
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, s)| json!({"id": 1000 + i as u32, "content": s, "special": true, "normalized": false}))
+    .collect();
+    let j = json!({"added_tokens": added, "model": {"type": "BPE", "vocab": vocab, "merges": []}});
+    crate::tokenizer::Tokenizer::from_json(&j.to_string()).unwrap()
+}
+
+// ------------------------------------------------------------------ the prompt being rendered
+
+/// The prompt text plus the byte ranges the chat template wrote as *structure*: role markers, think
+/// tags, DSML scaffolding, task tokens and the placeholders of real image inputs. Message text —
+/// user, assistant and tool content, tool schemas, arguments, response formats — is not structure,
+/// so the tokeniser spells it out as ordinary text (see `Tokenizer::encode_masked`). A special-token
+/// literal inside message text therefore cannot become a special id: it cannot forge a turn marker
+/// and cannot be mistaken for an image placeholder.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Prompt {
+    pub text: String,
+    /// Sorted, non-overlapping, on char boundaries.
+    pub structural: Vec<(usize, usize)>,
+}
+
+impl Prompt {
+    /// Append template structure: the only text an added token may be cut from.
+    pub fn push_struct(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        let a = self.text.len();
+        self.text.push_str(s);
+        self.structural.push((a, self.text.len()));
+    }
+
+    /// Append message text: never cut into added tokens.
+    pub fn push_text(&mut self, s: &str) {
+        self.text.push_str(s);
+    }
+}
+
+impl std::ops::Deref for Prompt {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl PartialEq<str> for Prompt {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
+}
+
+impl PartialEq<&str> for Prompt {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+impl std::fmt::Display for Prompt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// Test helper: the structural spans of a prompt written by hand from the template's own markers.
+/// Serving never derives spans this way; the renderer records them as it writes.
+#[cfg(test)]
+pub fn test_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut markers: Vec<&str> = vec![BOS, EOS, THINK_START, THINK_END, USER_SP, ASSISTANT_SP, SYSTEM_SP, LATEST_REMINDER_SP, IMAGE_PLACEHOLDER];
+    markers.extend(TASK_TOKENS.iter().map(|(_, t)| *t));
+    for m in markers {
+        let mut from = 0;
+        while let Some(p) = text[from..].find(m) {
+            let a = from + p;
+            out.push((a, a + m.len()));
+            from = a + m.len();
+        }
+    }
+    out.sort();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (a, e) in out {
+        match merged.last_mut() {
+            Some(last) if a < last.1 => last.1 = last.1.max(e),
+            _ => merged.push((a, e)),
+        }
+    }
+    merged
 }
 
 // ------------------------------------------------------------------ rendering
@@ -565,20 +661,21 @@ fn render_reasoning_effort(index: usize, mode: ThinkingMode, effort: Option<&Val
     }
 }
 
-fn render_tools(tools: &[Value]) -> String {
+/// The tools section. Its prose is template structure; the schemas are the request's own text.
+fn render_tools(p: &mut Prompt, tools: &[Value]) {
     let schemas: Vec<String> = tools.iter().map(to_json).collect();
     let d = DSML;
     let b = TOOL_CALLS_BLOCK;
     let c = TOOL_CALL_TAG;
-    let p = TOOL_PARAM_TAG;
-    format!(
+    let t = TOOL_PARAM_TAG;
+    p.push_struct(&format!(
         "## Tools
 
 You have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<{d}{b}>\" block like the following:
 
 <{d}{b}>
 <{d}{c} name=\"$TOOL_NAME\">
-<{d}{p} name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</{d}{p}>
+<{d}{t} name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</{d}{t}>
 ...
 </{d}{c}>
 <{d}{c} name=\"$TOOL_NAME2\">
@@ -594,12 +691,15 @@ Otherwise, output directly after {THINK_END} with tool calls or final response.
 
 ### Available Tool Schemas
 
-{}
+"
+    ));
+    p.push_text(&schemas.join("\n"));
+    p.push_struct(
+        "
 
 You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
 ",
-        schemas.join("\n")
-    )
+    );
 }
 
 /// json.loads, or None where Python raises.
@@ -607,8 +707,9 @@ fn py_json_loads(s: &str) -> Option<Value> {
     crate::pyjson::loads(s)
 }
 
-/// encoding.py encode_arguments_to_dsml.
-fn encode_arguments_to_dsml(arguments: &Value) -> String {
+/// encoding.py encode_arguments_to_dsml, written into the prompt. Parameter names and values come
+/// from the client's tool call, so they are text; only the DSML tags around them are structure.
+fn push_arguments_dsml(p: &mut Prompt, arguments: &Value) {
     let mut args = arguments.clone();
     if !args.is_object() {
         for _ in 0..2 {
@@ -624,31 +725,44 @@ fn encode_arguments_to_dsml(arguments: &Value) -> String {
             args = json!({"arguments": arguments.clone()});
         }
     }
-    let mut out = Vec::new();
-    for (k, v) in args.as_object().unwrap() {
+    for (i, (k, v)) in args.as_object().unwrap().iter().enumerate() {
+        if i > 0 {
+            p.push_text("\n");
+        }
         let (is_str, value) = match v {
             Value::String(s) => ("true", s.clone()),
             other => ("false", to_json(other)),
         };
-        out.push(format!("<{DSML}{TOOL_PARAM_TAG} name=\"{k}\" string=\"{is_str}\">{value}</{DSML}{TOOL_PARAM_TAG}>"));
+        p.push_struct(&format!("<{DSML}{TOOL_PARAM_TAG} name=\""));
+        p.push_text(k);
+        p.push_struct(&format!("\" string=\"{is_str}\">"));
+        p.push_text(&value);
+        p.push_struct(&format!("</{DSML}{TOOL_PARAM_TAG}>"));
     }
-    out.join("\n")
 }
 
 /// The tool-call block of an assistant message, from (name, arguments) pairs in the OpenAI form
 /// (arguments a JSON string or an object): `\n\n<｜DSML｜ calls>...</｜DSML｜ calls>`.
+fn push_tool_calls(p: &mut Prompt, calls: &[(Value, Value)]) {
+    p.push_struct(&format!("\n\n<{DSML}{TOOL_CALLS_BLOCK}>\n"));
+    for (i, (name, args)) in calls.iter().enumerate() {
+        if i > 0 {
+            p.push_text("\n");
+        }
+        p.push_struct(&format!("<{DSML}{TOOL_CALL_TAG} name=\""));
+        p.push_text(&py_str(name));
+        p.push_struct("\">\n");
+        push_arguments_dsml(p, args);
+        p.push_struct(&format!("\n</{DSML}{TOOL_CALL_TAG}>"));
+    }
+    p.push_struct(&format!("\n</{DSML}{TOOL_CALLS_BLOCK}>"));
+}
+
+/// The same block as a plain string (the mock engine writes one back as text).
 pub fn render_tool_calls(calls: &[(Value, Value)]) -> String {
-    let list: Vec<String> = calls
-        .iter()
-        .map(|(name, args)| {
-            format!(
-                "<{DSML}{TOOL_CALL_TAG} name=\"{}\">\n{}\n</{DSML}{TOOL_CALL_TAG}>",
-                py_str(name),
-                encode_arguments_to_dsml(args)
-            )
-        })
-        .collect();
-    format!("\n\n<{DSML}{TOOL_CALLS_BLOCK}>\n{}\n</{DSML}{TOOL_CALLS_BLOCK}>", list.join("\n"))
+    let mut p = Prompt::default();
+    push_tool_calls(&mut p, calls);
+    p.text
 }
 
 /// encoding.py find_last_user_index (mid-conversation system messages count as user). Under 1017 a
@@ -667,7 +781,7 @@ pub fn find_last_user_index(messages: &[Value], enc: Encoding) -> Result<Option<
                 if !b.is_object() {
                     return Err(err("AttributeError: content block is not an object"));
                 }
-                if matches!(get_str(b, "type"), Some("text") | Some("image") | Some("image_url")) {
+                if matches!(get_str(b, "type"), Some("text") | Some("image") | Some("image_url") | Some("image_placeholder")) {
                     starts_turn = true;
                     break;
                 }
@@ -682,13 +796,14 @@ pub fn find_last_user_index(messages: &[Value], enc: Encoding) -> Result<Option<
 }
 
 fn render_message(
+    p: &mut Prompt,
     index: usize,
     messages: &[Value],
     mode: ThinkingMode,
     drop_thinking: bool,
     effort: Option<&Value>,
     enc: Encoding,
-) -> Result<String, EncodeError> {
+) -> Result<(), EncodeError> {
     let msg = &messages[index];
     let last_user = find_last_user_index(messages, enc)?;
     let r = role(msg);
@@ -702,110 +817,114 @@ fn render_message(
     let wo_eos = truthy(get(msg, "wo_eos"));
 
     let effort_prompt = render_reasoning_effort(index, mode, effort, enc)?;
-    let mut prompt = String::new();
     if index == 0 && (!effort_prompt.is_empty() || r == Some("system")) {
-        prompt.push_str(SYSTEM_SP);
+        p.push_struct(SYSTEM_SP);
     }
-    prompt.push_str(&effort_prompt);
+    p.push_struct(&effort_prompt);
 
     match r {
         Some("system") => {
             if index > 0 {
-                prompt.push_str(SYSTEM_SP);
+                p.push_struct(SYSTEM_SP);
             }
-            prompt.push_str(&or_empty(content));
+            p.push_text(&or_empty(content));
             if let Some(t) = &tools {
-                prompt.push_str("\n\n");
-                prompt.push_str(&render_tools(t));
+                p.push_struct("\n\n");
+                render_tools(p, t);
             }
             if truthy(get(msg, "response_format")) {
-                prompt.push_str("\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n");
-                prompt.push_str(&to_json(get(msg, "response_format").unwrap()));
+                p.push_struct("\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n");
+                p.push_text(&to_json(get(msg, "response_format").unwrap()));
             }
         }
         Some("user") => {
-            prompt.push_str(USER_SP);
+            p.push_struct(USER_SP);
             if truthy(get(msg, "content_blocks")) {
                 let blocks = get(msg, "content_blocks").unwrap().as_array().ok_or_else(|| err("content_blocks must be a list"))?;
-                let mut parts = Vec::new();
-                for b in blocks {
+                for (bi, b) in blocks.iter().enumerate() {
                     if !b.is_object() {
                         return Err(err("AttributeError: content block is not an object"));
                     }
+                    if bi > 0 {
+                        p.push_text("\n\n");
+                    }
                     match get_str(b, "type") {
-                        Some("text") => parts.push(match get(b, "text") {
+                        Some("text") => p.push_text(&match get(b, "text") {
                             None => String::new(),
                             Some(Value::String(s)) => s.clone(),
                             Some(_) => return Err(err("TypeError: text must be a string")),
                         }),
+                        Some("image_placeholder") => p.push_struct(IMAGE_PLACEHOLDER),
                         Some("tool_result") => {
                             let tc = get(b, "content").cloned().unwrap_or(json!(""));
-                            let text = match &tc {
+                            p.push_struct("<tool_result>");
+                            match &tc {
                                 Value::Array(items) => {
-                                    let mut tp = Vec::new();
-                                    for it in items {
+                                    for (ti, it) in items.iter().enumerate() {
                                         if !it.is_object() {
                                             return Err(err("AttributeError: tool result block is not an object"));
                                         }
+                                        if ti > 0 {
+                                            p.push_text("\n\n");
+                                        }
                                         if get_str(it, "type") == Some("text") {
-                                            tp.push(match get(it, "text") {
+                                            p.push_text(&match get(it, "text") {
                                                 None => String::new(),
                                                 Some(Value::String(s)) => s.clone(),
                                                 Some(_) => return Err(err("TypeError: text must be a string")),
                                             });
                                         } else {
-                                            tp.push(format!("[Unsupported {}]", py_str(get(it, "type").unwrap_or(&Value::Null))));
+                                            p.push_text(&format!("[Unsupported {}]", py_str(get(it, "type").unwrap_or(&Value::Null))));
                                         }
                                     }
-                                    tp.join("\n\n")
                                 }
-                                other => py_str(other),
-                            };
-                            parts.push(format!("<tool_result>{text}</tool_result>"));
+                                other => p.push_text(&py_str(other)),
+                            }
+                            p.push_struct("</tool_result>");
                         }
-                        _ => parts.push(format!("[Unsupported {}]", py_str(get(b, "type").unwrap_or(&Value::Null)))),
+                        _ => p.push_text(&format!("[Unsupported {}]", py_str(get(b, "type").unwrap_or(&Value::Null)))),
                     }
                 }
-                prompt.push_str(&parts.join("\n\n"));
             } else {
                 // `prompt += content or ""`: concatenation, so only a string will do.
                 match content {
-                    Some(Value::String(s)) => prompt.push_str(s),
+                    Some(Value::String(s)) => p.push_text(s),
                     c if !truthy(c) => {}
                     _ => return Err(err("TypeError: user content must be a string")),
                 }
             }
         }
         Some("latest_reminder") => {
-            prompt.push_str(LATEST_REMINDER_SP);
-            prompt.push_str(&py_str(content.unwrap_or(&Value::Null)));
+            p.push_struct(LATEST_REMINDER_SP);
+            p.push_text(&py_str(content.unwrap_or(&Value::Null)));
         }
         Some("tool") => {
             return Err(err("deepseek_v41 merges tool messages into user; please preprocess with merge_tool_messages()"))
         }
         Some("assistant") => {
-            let tc_content = match &tool_calls {
-                Some(tcs) => render_tool_calls(tcs),
-                None => String::new(),
-            };
             let summary = or_empty(content);
             let rc = or_empty(get(msg, "reasoning_content"));
             let prev_has_task = index >= 1 && is_task_set(&messages[index - 1]);
-            let mut thinking_part = String::new();
+            let mut thinking = String::new();
             if mode == ThinkingMode::Thinking && !prev_has_task {
                 let after_last_user = match last_user {
                     Some(lu) => index > lu,
                     None => true,
                 };
                 if !drop_thinking || after_last_user {
-                    thinking_part = format!("{rc}{THINK_END}");
+                    thinking = format!("{rc}{THINK_END}");
                 }
             }
-            prompt.push_str(&thinking_part);
-            prompt.push_str(&summary);
-            prompt.push_str(&tc_content);
+            if let Some(rc) = thinking.strip_suffix(THINK_END) {
+                p.push_text(rc);
+                p.push_struct(THINK_END);
+            }
+            p.push_text(&summary);
+            if let Some(tcs) = &tool_calls {
+                push_tool_calls(p, tcs);
+            }
             if !wo_eos {
-                prompt.push_str(EOS);
+                p.push_struct(EOS);
             }
         }
         other => return Err(err(format!("Unknown role: {}", other.map_or("None".to_string(), |s| s.to_string())))),
@@ -813,34 +932,34 @@ fn render_message(
 
     // Transition tokens, depending on what follows.
     if index + 1 < messages.len() && !matches!(role(&messages[index + 1]), Some("assistant") | Some("latest_reminder")) {
-        return Ok(prompt);
+        return Ok(());
     }
     if is_task_set(msg) {
         let task = get(msg, "task").unwrap();
         let t = task.as_str().and_then(|t| TASK_TOKENS.iter().find(|(n, _)| *n == t));
         let (name, tok) = t.ok_or_else(|| err(format!("Invalid task: '{}'", py_str(task))))?;
         if *name != "action" {
-            prompt.push_str(tok);
+            p.push_struct(tok);
         } else {
-            prompt.push_str(ASSISTANT_SP);
-            prompt.push_str(if mode != ThinkingMode::Thinking { THINK_END } else { THINK_START });
-            prompt.push_str(tok);
+            p.push_struct(ASSISTANT_SP);
+            p.push_struct(if mode != ThinkingMode::Thinking { THINK_END } else { THINK_START });
+            p.push_struct(tok);
         }
     } else if r == Some("user") || (r == Some("system") && index > 0) {
-        prompt.push_str(ASSISTANT_SP);
+        p.push_struct(ASSISTANT_SP);
         let at_or_after_last_user = match last_user {
             Some(lu) => index >= lu,
             None => true,
         };
         if !drop_thinking && mode == ThinkingMode::Thinking {
-            prompt.push_str(THINK_START);
+            p.push_struct(THINK_START);
         } else if drop_thinking && mode == ThinkingMode::Thinking && at_or_after_last_user {
-            prompt.push_str(THINK_START);
+            p.push_struct(THINK_START);
         } else {
-            prompt.push_str(THINK_END);
+            p.push_struct(THINK_END);
         }
     }
-    Ok(prompt)
+    Ok(())
 }
 
 /// encoding.py _drop_thinking_messages.
@@ -867,7 +986,7 @@ fn drop_thinking_messages(messages: &[Value], enc: Encoding) -> Result<Vec<Value
 
 /// encoding.py _encode_messages_text. V4.1's merges the tool messages and sorts the results here;
 /// 1017's gets them merged and sorted (encode_messages).
-fn encode_messages_text(messages: &[Value], o: &EncodeOptions, context: &[Value]) -> Result<String, EncodeError> {
+fn encode_messages_text(messages: &[Value], o: &EncodeOptions, context: &[Value]) -> Result<Prompt, EncodeError> {
     let enc = o.encoding;
     let (messages, context): (Vec<Value>, Vec<Value>) = if enc == Encoding::V41 {
         let merged = merge_tool_messages(messages, enc);
@@ -887,7 +1006,10 @@ fn encode_messages_text(messages: &[Value], o: &EncodeOptions, context: &[Value]
     };
     let mut full: Vec<Value> = context.iter().cloned().chain(messages.iter().cloned()).collect();
 
-    let mut prompt = if o.add_default_bos_token && context.is_empty() { BOS.to_string() } else { String::new() };
+    let mut prompt = Prompt::default();
+    if o.add_default_bos_token && context.is_empty() {
+        prompt.push_struct(BOS);
+    }
     let effective_drop = o.drop_thinking && !full.iter().any(|m| truthy(get(m, "tools")));
     // Signed, as in Python: with odd roles in the context the count can come out negative (nothing
     // is rendered then).
@@ -903,20 +1025,19 @@ fn encode_messages_text(messages: &[Value], o: &EncodeOptions, context: &[Value]
         if i < 0 || i as usize >= full.len() {
             return Err(err("IndexError: message index out of range"));
         }
-        prompt.push_str(&render_message(i as usize, &full, o.thinking_mode, effective_drop, o.reasoning_effort, enc)?);
+        render_message(&mut prompt, i as usize, &full, o.thinking_mode, effective_drop, o.reasoning_effort, enc)?;
     }
     Ok(prompt)
 }
 
-/// encoding.py encode_messages (text): the prompt string, plus the image records it found.
-pub fn encode_messages(messages: &[Value], o: &EncodeOptions) -> Result<(String, Vec<Value>), EncodeError> {
+/// encoding.py encode_messages (text): the prompt, plus the image records it found. The prompt
+/// carries the byte ranges its template wrote as structure, so the tokeniser can spell message text
+/// out as ordinary text (docs/engine.md, "Special-token literals in message text").
+pub fn encode_messages(messages: &[Value], o: &EncodeOptions) -> Result<(Prompt, Vec<Value>), EncodeError> {
     if o.encoding == Encoding::V41_1017 {
-        // validated before the merge, which can drop a tool message's own fields; the images are
-        // collected once the tool results are in their final order
+        // merged before the images are collected, as 1017 does; the images are collected once the
+        // tool results are in their final order
         let ctx = o.context.unwrap_or(&[]);
-        for m in ctx.iter().chain(messages) {
-            validate_no_image_sp_tokens(m)?;
-        }
         let context = merge_tool_messages(ctx, o.encoding);
         let mut all: Vec<Value> = context.iter().cloned().chain(merge_tool_messages(messages, o.encoding)).collect();
         sort_tool_results_by_call_order(&mut all); // in place, so the context comes out sorted too
@@ -1376,6 +1497,110 @@ mod tests {
         let x = json!("xhigh");
         o.reasoning_effort = Some(&x);
         assert!(encode_messages(&msgs, &o).is_err());
+    }
+
+    // ---------------------------------------------------------------- special tokens in text
+
+    /// Every special-token literal in message text is text: it encodes as ordinary tokens, so it
+    /// cannot forge a role marker, cannot be counted as an image placeholder, and comes back
+    /// unchanged when the prompt's ids are decoded.
+    #[test]
+    fn special_token_literals_in_text_are_plain_text() {
+        let tok = mini_tokenizer();
+        let lit = [
+            IMAGE_PLACEHOLDER,
+            BOS,
+            EOS,
+            USER_SP,
+            ASSISTANT_SP,
+            SYSTEM_SP,
+            LATEST_REMINDER_SP,
+            THINK_START,
+            THINK_END,
+            "<｜DSML｜ invoke name=\"x\">",
+        ];
+        let poison = lit.join(" ");
+        let msgs: Vec<Value> = json!([
+            {"role": "system", "content": format!("The source reads {USER_SP} inside a string.")},
+            {"role": "user", "content": format!("Literal tokens: {poison}")},
+            {"role": "assistant", "reasoning_content": format!("it prints {THINK_END} and {IMAGE_PLACEHOLDER}"),
+             "content": format!("{ASSISTANT_SP} is only text here")},
+            {"role": "user", "content_blocks": [
+                {"type": "text", "text": format!("in a block: {IMAGE_PLACEHOLDER}")},
+                {"type": "tool_result", "content": [{"type": "text", "text": format!("in a tool result: {BOS}")}]}
+            ]},
+            {"role": "user", "content": format!("and in a plain message: {IMAGE_PLACEHOLDER}")}
+        ])
+        .as_array()
+        .cloned()
+        .unwrap();
+
+        // the encoding used to refuse this outright ("Message content contains image special token")
+        let (p, images) = encode_messages(&msgs, &EncodeOptions::new(ThinkingMode::Thinking)).unwrap();
+        assert!(images.is_empty(), "no image block, so no image record: {images:?}");
+        for l in lit {
+            assert!(p.text.contains(l), "the literal is still in the prompt: {l}");
+        }
+
+        let ids = tok.encode_masked(&p.text, &p.structural);
+        assert_eq!(tok.decode(&ids), p.text, "the model sees exactly the rendered text");
+        for l in lit {
+            let id = tok.token_id(l).unwrap();
+            let got = ids.iter().filter(|&&x| x == id).count();
+            let want: usize = p.structural.iter().map(|&(a, e)| p.text[a..e].matches(l).count()).sum();
+            assert_eq!(got, want, "{l} appears as a special id {} times, the template wrote it {want}", got);
+        }
+        // The literals are really there, so the mask is what protects them: the unmasked encoding
+        // of the same prompt does turn them into special ids.
+        let unmasked = tok.encode(&p.text);
+        assert!(unmasked.iter().filter(|&&x| x == tok.token_id(IMAGE_PLACEHOLDER).unwrap()).count() > 1);
+    }
+
+    /// A real image block still becomes one placeholder, and a literal that looks like a placeholder
+    /// in the same message stays text.
+    #[test]
+    fn real_image_block_still_yields_one_placeholder() {
+        let tok = mini_tokenizer();
+        let msgs: Vec<Value> = json!([{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": format!("what is this? a literal {IMAGE_PLACEHOLDER} in text")},
+                {"type": "image_url", "image_url": {"url": "http://x/y.png"}}
+            ]
+        }])
+        .as_array()
+        .cloned()
+        .unwrap();
+        let (p, images) = encode_messages(&msgs, &EncodeOptions::new(ThinkingMode::Chat)).unwrap();
+        assert_eq!(images.len(), 1, "the image block is still collected: {images:?}");
+        let ids = tok.encode_masked(&p.text, &p.structural);
+        let ph = tok.token_id(IMAGE_PLACEHOLDER).unwrap();
+        assert_eq!(ids.iter().filter(|&&x| x == ph).count(), 1, "one placeholder: the real image's");
+        assert_eq!(tok.decode(&ids), p.text);
+        // the one structural placeholder is the image block's; the literal in the text block is not
+        let structural_ph: Vec<&(usize, usize)> = p.structural.iter().filter(|&&(a, e)| &p.text[a..e] == IMAGE_PLACEHOLDER).collect();
+        assert_eq!(structural_ph.len(), 1);
+        assert_eq!(p.text.matches(IMAGE_PLACEHOLDER).count(), 2, "one from the image block, one typed in the text");
+    }
+
+    /// A long prompt takes the parallel encoder; its cuts must not change what the mask protects.
+    #[test]
+    fn masked_parallel_encoding_matches_the_single_pass() {
+        let tok = mini_tokenizer();
+        let unit = format!("row with a literal {IMAGE_PLACEHOLDER} and {USER_SP} and {THINK_END}\n");
+        let mut text = String::new();
+        let a = text.len();
+        text.push_str(USER_SP);
+        let structural = vec![(a, text.len())];
+        text.push_str(&unit.repeat(4000));
+        assert!(text.len() > 2 * (1 << 16), "the parallel path is taken: {} bytes", text.len());
+        let one = tok.encode_masked(&text, &structural);
+        let many = tok.encode_parallel_masked(&text, &structural, 4);
+        assert_eq!(one, many);
+        assert_eq!(tok.decode(&many), text);
+        let ph = tok.token_id(IMAGE_PLACEHOLDER).unwrap();
+        assert_eq!(many.iter().filter(|&&x| x == ph).count(), 0, "no literal became a placeholder");
+        assert_eq!(many.iter().filter(|&&x| x == tok.token_id(USER_SP).unwrap()).count(), 1, "one real marker");
     }
 
     #[test]
