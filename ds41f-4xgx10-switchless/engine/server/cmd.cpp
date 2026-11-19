@@ -731,52 +731,39 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
 
 // Every rank's part of a steering set (docs/steering-control.md): apply, or confirm, at this step
 // boundary, then exchange the four confirmations. Rank divergence is detected here, never assumed away.
-static SteerAck steer_sync_all(model::Model& m, comm::Ring& ring, float alpha, uint64_t epoch, int rank, bool apply,
-                              SteerAck all[4]) {
+static void steer_sync_all(model::Model& m, comm::Ring& ring, float alpha, uint64_t epoch,
+                           uint64_t target_epoch, int rank, uint32_t flags, SteerAck all[4]) {
   SteerAck mine;
   mine.rank = rank;
   std::string why;
-  if (!apply) {
-    const model::Model::SteerInfo i = m.steer_info();
-    mine.alpha = i.alpha;
-    mine.epoch = i.epoch;
-    mine.ok = i.on ? 1 : 0;
-    if (!i.on) std::snprintf(mine.why, sizeof mine.why, "steering is off");
-  } else {
-    float conf = 0.f;
-    uint64_t got = 0;
-    if (m.steer_set(alpha, epoch, &conf, &got, &why)) {
-      mine.alpha = conf;
-      mine.epoch = got;
-      mine.ok = 1;
-    } else {
-      const model::Model::SteerInfo i = m.steer_info();
-      mine.alpha = i.alpha;
-      mine.epoch = i.epoch;
-      mine.ok = 0;
-      std::snprintf(mine.why, sizeof mine.why, "%s", why.empty() ? "refused" : why.c_str());
-    }
-  }
+  float conf = m.steer_info().alpha;
+  uint64_t got = m.steer_epoch();
+  const bool ok = flags & kSteerConfirm ? m.steer_read(&conf, &why) :
+      m.steer_set(alpha, epoch, target_epoch, flags & kSteerRecover, &conf, &got, &why);
+  const auto info = m.steer_info();
+  mine.alpha = conf;
+  mine.epoch = info.epoch;
+  mine.config_id = info.config_id;
+  mine.ok = ok;
+  std::snprintf(mine.why, sizeof mine.why, "%s", why.c_str());
   std::memset(all, 0, 4 * sizeof(SteerAck));
   ring.allgather_host(&mine, all, sizeof(SteerAck));
-  return all[0];  // every rank gets the same array back; rank 0 reads all four
 }
 
-void steer_broadcast(model::Model& m, comm::Ring& ring, float alpha, uint64_t epoch, SteerAck all[4]) {
+void steer_broadcast(model::Model& m, comm::Ring& ring, model::SteerOp op, float alpha,
+                     uint64_t epoch, uint64_t target_epoch, SteerAck all[4]) {
   Cmd c{};
   c.op = kCmdSteer;
+  c.flags = op == model::SteerOp::kRead ? kSteerConfirm : (op == model::SteerOp::kRecover ? kSteerRecover : 0);
   c.steer_alpha = alpha;
   c.steer_epoch = epoch;
-  bcast(ring, c);  // the followers take the branch below and meet this rank in the ack all-gather
-  steer_sync_all(m, ring, alpha, epoch, 0, true, all);
+  c.steer_target_epoch = target_epoch;
+  bcast(ring, c);
+  steer_sync_all(m, ring, alpha, epoch, target_epoch, 0, c.flags, all);
 }
 
 void steer_readback(model::Model& m, comm::Ring& ring, SteerAck all[4]) {
-  Cmd c{};
-  c.op = kCmdSteer;
-  c.flags = kSteerConfirm;
-  bcast(ring, c);
-  steer_sync_all(m, ring, 0.f, model::kSteerAnyEpoch, 0, false, all);
+  steer_broadcast(m, ring, model::SteerOp::kRead, 0.f, 0, 0, all);
 }
 
 void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
@@ -836,7 +823,7 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
       wd.started = 0;
     } else if (c.op == kCmdSteer) {
       SteerAck all[4];
-      steer_sync_all(m, ring, c.steer_alpha, c.steer_epoch, rank, (c.flags & kSteerConfirm) == 0, all);
+      steer_sync_all(m, ring, c.steer_alpha, c.steer_epoch, c.steer_target_epoch, rank, c.flags, all);
       if (!all[rank].ok)
         std::fprintf(stderr, "rank %d: steering set refused: %s\n", rank, all[rank].why);
     } else if (c.op != kCmdState) {

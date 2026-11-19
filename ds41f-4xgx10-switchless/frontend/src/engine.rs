@@ -94,7 +94,7 @@ impl EngineClient {
         self.steer(Frame::SteerSet { req_id: 0, alpha }, timeout).await
     }
 
-    /// Read the effective steering state back from every rank, changing nothing.
+    /// Read every device; the server may complete pending recovery before returning a safe result.
     pub async fn steer_get(&self, timeout: Duration) -> Result<SteerState, String> {
         self.steer(Frame::SteerGet { req_id: 0 }, timeout).await
     }

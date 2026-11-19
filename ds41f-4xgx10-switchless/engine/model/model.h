@@ -13,6 +13,7 @@
 #include "engram/engram.h"
 #include "model/config.h"
 #include "model/ops.h"
+#include "model/steer.h"
 #include "weights/loader.h"
 
 namespace model {
@@ -226,13 +227,12 @@ class Model {
     uint64_t layers = 0;
   };
   SteerInfo steer_info() const;
-  // Apply one alpha to all traffic at a step boundary: refused when steering is off, when the value is
-  // outside [kSteerAlphaMin, kSteerAlphaMax], when the caller's epoch view is stale, or when a step is
-  // still in flight (call drain() first, or between commands). The device scalar is written and read
-  // back; the host copy the layer boundary reads follows it; the CUDA step graphs are dropped, so no
-  // graph captured under another steering state can replay. On any failure nothing changes.
-  // Returns true and the confirmed value, otherwise false and why.
-  bool steer_set(float alpha, uint64_t expect_epoch, float* confirmed, uint64_t* epoch, std::string* why);
+  SteerConfig steer_config() const;
+  bool steer_read(float* confirmed, std::string* why);  // actual device read, not host reporting
+  // Explicit target epoch; recovery always writes and verifies, even if host alpha is unchanged.
+  // A failure after writing marks the device unconfirmed; only verified recovery admits traffic.
+  bool steer_set(float alpha, uint64_t expect_epoch, uint64_t target_epoch, bool recovery,
+                 float* confirmed, uint64_t* epoch, std::string* why);
   uint64_t steer_epoch() const;  // the epoch a new request's state is tagged with
 
   unsigned spec_batch_mismatches() const;

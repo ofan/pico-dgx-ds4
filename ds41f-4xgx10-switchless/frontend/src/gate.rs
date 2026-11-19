@@ -25,6 +25,8 @@ struct State {
     held: Option<Instant>,
     /// requests wait: a steering change is draining and applying (docs/steering-control.md)
     steering: bool,
+    /// a dispatched control outcome is unknown or recovery is unconfirmed; release cannot clear it
+    uncertain: bool,
     /// the server is shutting down: waiting requests are answered at once
     closing: bool,
     in_flight: u32,
@@ -54,9 +56,22 @@ impl Drop for Pass {
     }
 }
 
-/// Requests are held off while a steering change drains and applies; dropping it admits them again.
+/// Dropping ends the active command, but NEVER clears an unknown dispatched outcome.
 pub struct Quiesced {
     gate: Arc<Gate>,
+}
+
+impl Quiesced {
+    fn dispatched(&self) {
+        self.gate.st.lock().unwrap().uncertain = true;
+    }
+    fn confirm(&self, st: &SteerState) {
+        // A recovered refusal can be safe; an ordinary error or lost reply cannot be.
+        let confirmed = st.admission_safe && st.alpha.is_finite() && st.ranks.len() == 4 &&
+            (0..4).all(|rank| st.ranks.iter().filter(|r| r.rank == rank && r.ok &&
+                r.alpha.to_bits() == st.alpha.to_bits() && r.epoch == st.epoch).count() == 1);
+        if confirmed { self.gate.st.lock().unwrap().uncertain = false; }
+    }
 }
 
 impl Drop for Quiesced {
@@ -97,6 +112,7 @@ impl Gate {
             st: Mutex::new(State {
                 held: None,
                 steering: false,
+                uncertain: false,
                 closing: false,
                 in_flight: 0,
                 waiting: 0,
@@ -126,7 +142,7 @@ impl Gate {
                 if s.closing {
                     return Err(Refused::Closing);
                 }
-                if s.held.is_none() && !s.steering && connected() {
+                if s.held.is_none() && !s.steering && !s.uncertain && connected() {
                     s.in_flight += 1;
                     s.last = Instant::now();
                     if w.counted {
@@ -167,7 +183,8 @@ impl Gate {
     }
 
     /// Stop admitting requests and wait for those in flight to finish, so that a steering change lands
-    /// at a boundary no request crosses. The guard's drop admits again. A request already in flight is
+    /// at a boundary no request crosses. Drop only releases the active-command hold, not an uncertain
+    /// dispatched outcome. A request already in flight is
     /// never cut: it finishes under the alpha it started with.
     pub async fn quiesce(self: &Arc<Gate>, timeout: Duration) -> Result<Quiesced, String> {
         {
@@ -177,12 +194,13 @@ impl Gate {
             }
             s.steering = true;
         }
+        let guard = Quiesced { gate: self.clone() };
         let t0 = Instant::now();
         loop {
             {
                 let s = self.st.lock().unwrap();
                 if s.in_flight == 0 {
-                    return Ok(Quiesced { gate: self.clone() });
+                    return Ok(guard);
                 }
             }
             if t0.elapsed() >= timeout {
@@ -193,7 +211,6 @@ impl Gate {
                     timeout.as_secs()
                 );
                 drop(s);
-                self.st.lock().unwrap().steering = false;
                 return Err(msg);
             }
             tokio::time::sleep(POLL).await;
@@ -216,7 +233,7 @@ impl Gate {
         let s = self.st.lock().unwrap();
         format!(
             "held {} in_flight {} waiting {} idle_s {} engine {} held_s {} passed {} refused {}",
-            (s.held.is_some() || s.steering) as u8,
+            (s.held.is_some() || s.steering || s.uncertain) as u8,
             s.in_flight,
             s.waiting,
             s.last.elapsed().as_secs(),
@@ -230,7 +247,7 @@ impl Gate {
     /// Whether a request would pass now, without waiting: the ring not lent, the engine connected.
     pub fn open(&self, connected: bool) -> bool {
         let s = self.st.lock().unwrap();
-        !s.closing && s.held.is_none() && !s.steering && connected
+        !s.closing && s.held.is_none() && !s.steering && !s.uncertain && connected
     }
 
     /// Whether requests wait because the ring is lent (for /health).
@@ -274,19 +291,20 @@ pub async fn steer(engine: &EngineClient, gate: &Arc<Gate>, line: &str, timeout:
     if engine.info().is_none() {
         return "error: the engine is not connected".into();
     }
-    let Some(alpha) = set else {
-        return match engine.steer_get(timeout).await {
-            Ok(st) => steer_line(&st),
-            Err(e) => format!("error: {e}"),
-        };
-    };
-    let _guard = match gate.quiesce(timeout).await {
+    let guard = match gate.quiesce(timeout).await {
         Ok(g) => g,
         Err(e) => return format!("error: {e}"),
     };
-    match engine.steer_set(alpha, timeout).await {
-        Ok(st) => steer_line(&st),
-        Err(e) => format!("error: {e}"),
+    // This precedes sending: timeout, disconnect, or future cancellation all stay fail-closed.
+    // A subsequent `steer` query is serialized behind the old command and can confirm recovery.
+    guard.dispatched();
+    let outcome = match set {
+        Some(alpha) => engine.steer_set(alpha, timeout).await,
+        None => engine.steer_get(timeout).await,
+    };
+    match outcome {
+        Ok(st) => { guard.confirm(&st); steer_line(&st) },
+        Err(e) => format!("error: {e}; admission closed until a confirmed steer read/recovery"),
     }
 }
 
@@ -349,6 +367,7 @@ pub async fn admin(gate: Arc<Gate>, engine: EngineClient, path: PathBuf) -> std:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[tokio::test]
@@ -382,10 +401,58 @@ mod tests {
         let p = g.enter_when(on).await.unwrap();
         let first = g.quiesce(Duration::from_secs(5));
         tokio::pin!(first);
+        assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(first.as_mut().poll(cx).is_pending())).await,
+                "poll the first future so it actually acquires the gate");
         let other = g.quiesce(Duration::from_millis(10)).await;
-        assert!(other.is_err(), "a second steering change is refused while one runs");
+        assert_eq!(other.err().as_deref(), Some("a steering change is already in progress"));
         drop(p);
         assert!(first.await.is_ok());
+    }
+
+    fn confirmation(safe: bool, ok: bool) -> SteerState {
+        SteerState { req_id: 1, epoch: 2, alpha: 0.75, on: true, ok, admission_safe: safe,
+            ranks: (0..4).map(|rank| crate::protocol::SteerRank {
+                rank, epoch: 2, alpha: 0.75, ok: true, why: String::new() }).collect(), error: String::new() }
+    }
+
+    #[tokio::test]
+    async fn unknown_outcome_and_failed_recovery_stay_closed() {
+        let g = Gate::new(Duration::from_millis(20));
+        let q = g.quiesce(Duration::from_secs(1)).await.unwrap();
+        q.dispatched();
+        drop(q); // timeout/disconnect/cancellation after send: not a harmless drain failure
+        assert!(!g.open(true));
+        g.release();
+        assert!(!g.open(true), "lease release cannot bypass steering recovery");
+        assert!(matches!(g.enter_when(|| true).await, Err(Refused::Held(_))));
+        let q = g.quiesce(Duration::from_secs(1)).await.unwrap();
+        q.confirm(&confirmation(false, false));
+        drop(q);
+        assert!(!g.open(true), "unconfirmed rollback stays closed");
+        let q = g.quiesce(Duration::from_secs(1)).await.unwrap();
+        let mut bad = confirmation(true, false);
+        bad.ranks[3].epoch = 1;
+        q.confirm(&bad);
+        drop(q);
+        assert!(!g.open(true), "safe bit alone cannot reopen divergent rank state");
+        let q = g.quiesce(Duration::from_secs(1)).await.unwrap();
+        q.confirm(&confirmation(true, false)); // failed set, confirmed recovery
+        drop(q);
+        assert!(g.open(true));
+    }
+
+    #[tokio::test]
+    async fn cancelled_drain_releases_only_undispatched_hold() {
+        let g = Gate::new(Duration::from_millis(20));
+        let p = g.enter_when(|| true).await.unwrap();
+        {
+            let first = g.quiesce(Duration::from_secs(5));
+            tokio::pin!(first);
+            assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(first.as_mut().poll(cx).is_pending())).await);
+            assert!(!g.open(true));
+        }
+        drop(p);
+        assert!(g.open(true));
     }
 
     #[tokio::test]

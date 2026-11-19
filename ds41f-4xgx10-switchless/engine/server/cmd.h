@@ -74,7 +74,7 @@ enum : int32_t {
   kCmdSteer = 22,
 };
 // kCmdSteer's flags
-enum : uint32_t { kSteerConfirm = 1 };  // read the state back; change nothing (STEER_GET)
+enum : uint32_t { kSteerConfirm = 1, kSteerRecover = 2 };  // device read, or forced recovery write
 enum : uint32_t { kPfSample = 1, kPfCed = 2 };  // kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md)
 struct Cmd {
   int32_t op = kCmdStop;
@@ -115,26 +115,19 @@ struct Cmd {
   // kCmdDecode: the drafts' rate (SpecRate) to start from: a request decoded in slices goes on with the
   // last slice's (DecodeEnd::spec_tok, spec_ms)
   double spec_tok = 1, spec_ms = 0;
-  // kCmdSteer: the alpha to apply and the epoch every rank is expected to be at. Rank 0's rollback
-  // passes kSteerAnyEpoch (the ranks may have diverged; the value is restored, not compared).
+  // kCmdSteer: expected epoch and explicit target epoch. Recovery forces the device write on all
+  // ranks, bypasses the expectation, and assigns the common recovery epoch.
   float steer_alpha = 0.f;
   uint64_t steer_epoch = 0;
+  uint64_t steer_target_epoch = 0;
 };
 
 // kCmdSteer's expectation when the epoch cannot be assumed: model::kSteerAnyEpoch (model/steer.h).
 
 // What one rank holds after a steering set, exchanged once per set (4 x ~120 bytes).
-struct SteerAck {
-  float alpha = 0.f;
-  uint64_t epoch = 0;
-  int32_t ok = 0;
-  int32_t rank = 0;
-  char why[96] = {};
-};
-
-// Rank 0 only: apply `alpha` on all four ranks at one step boundary and collect the confirmations
-// (all[4], by rank). Every rank's own refusal is in its ack; nothing here decides what is acceptable.
-void steer_broadcast(model::Model& m, comm::Ring& ring, float alpha, uint64_t epoch, SteerAck all[4]);
+using SteerAck = model::SteerAck;
+void steer_broadcast(model::Model& m, comm::Ring& ring, model::SteerOp op, float alpha,
+                     uint64_t epoch, uint64_t target_epoch, SteerAck all[4]);
 // Rank 0 only: read every rank's effective state back, changing nothing.
 void steer_readback(model::Model& m, comm::Ring& ring, SteerAck all[4]);
 

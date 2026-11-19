@@ -130,8 +130,9 @@ struct Model::Impl {
   // The runtime control over glp.alpha (steer.h, docs/steering-control.md): one configuration for all
   // traffic, a monotonic epoch, and the accepted range. Applied only between steps (steer_set).
   SteerState steer;
+  bool steer_device_confirmed = true;
   void steer_layer(int L, int R, const float* pre, bf16* yraw);
-  bool steer_set(float alpha, uint64_t expect_epoch, float* confirmed, uint64_t* epoch, std::string* why);
+  bool steer_set(float alpha, uint64_t expect_epoch, uint64_t target_epoch, bool recovery, float* confirmed, uint64_t* epoch, std::string* why);
 
   // weights
   detail::LayerW lw[kLayers];

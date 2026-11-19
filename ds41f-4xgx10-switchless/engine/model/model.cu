@@ -241,57 +241,37 @@ void Model::Impl::steer_layer(int L, int R, const float* pre, bf16* yraw) {
   }
 }
 
-// The runtime alpha, applied between steps (docs/steering-control.md). Every refusal leaves the state
-// untouched; the caller rolls back nothing on a refusal because nothing moved.
-bool Model::Impl::steer_set(float alpha, uint64_t expect_epoch, float* confirmed, uint64_t* epoch, std::string* why) {
-  if (!glp.on) {
-    *why = "steering is off (WEIGHTLESS_STEER_PATH is unset); an alpha alone does not enable it";
+// No model mutation overlaps a step. Recovery always writes, including when the host already
+// names the old alpha: a prior write/read-back failure may have left the device elsewhere.
+bool Model::Impl::steer_set(float alpha, uint64_t expect_epoch, uint64_t target_epoch, bool recovery,
+                            float* confirmed, uint64_t* epoch, std::string* why) {
+  if (!glp.on || !std::isfinite(alpha) || (!recovery && steer_check(steer.config(), alpha) == SteerCheck::kBadAlpha)) {
+    *why = "steering is off or alpha is outside the finite runtime range [0, 2]";
     return false;
   }
-  if (!(std::isfinite(alpha)) || alpha < kSteerAlphaMin || alpha > kSteerAlphaMax) {
-    char buf[128];
-    std::snprintf(buf, sizeof buf, "alpha is outside [%g, %g]", (double)kSteerAlphaMin, (double)kSteerAlphaMax);
-    *why = buf;
+  if ((!recovery && (steer.epoch() != expect_epoch || target_epoch != expect_epoch + 1)) ||
+      (recovery && target_epoch < steer.epoch())) {
+    *why = "stale steering epoch";
     return false;
   }
-  if (expect_epoch != kSteerAnyEpoch && steer.epoch() != expect_epoch) {
-    *why = "the caller's epoch view is stale";
-    return false;
-  }
-  if (n_steps != n_done) {  // a launched step has not been waited for: not a step boundary
-    *why = "a step is in flight";
-    return false;
-  }
-  sync();  // nothing queued on the model's stream either
-  if (steer.check(alpha) == SteerCheck::kNoop) {
-    *confirmed = steer.config().alpha;
-    *epoch = steer.epoch();
-    return true;
-  }
-  float back = 0.f;
-  CUDA_CHECK(cudaMemcpy(glp_alpha, &alpha, sizeof(float), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(&back, glp_alpha, sizeof(float), cudaMemcpyDeviceToHost));
-  if (std::memcmp(&back, &alpha, sizeof(float)) != 0) {
-    *why = "the device read-back differs from the value written";
-    return false;
-  }
-  glp.alpha = back;  // the layer boundaries' host branch (steer_layer, prefill.cu) reads this
-  const uint64_t e = steer.commit(back);
-  // No graph may replay a capture made under another steering state. Dropping them is the invalidation:
-  // the next step of each (rows, context bucket) is captured again. The kernels have run, so a capture
-  // needs no further warm-up. Both caches go: this one, and the spec step graphs, whose bodies run the
-  // same layer loop (the steering branch, and whether the pre-write copy `sub` is made, are host
-  // decisions taken at capture time, so a graph is only valid for the alpha it was captured under).
-  const size_t dropped = graphs.size();
-  for (auto& g : graphs) CUDA_CHECK(cudaGraphExecDestroy(g.second));
-  graphs.clear();
-  spec_drop_graphs();
-  *confirmed = back;
-  *epoch = e;
-  if (rank == 0)
-    std::printf("glp: runtime alpha %g at epoch %llu (%zu step graphs dropped)\n", (double)back,
-                (unsigned long long)e, dropped);
-  return true;
+  if (n_steps != n_done) { *why = "a step is in flight"; return false; }
+  sync();
+  const bool ok = steer_device_apply(steer, glp.alpha, steer_device_confirmed, alpha, target_epoch,
+    [&] {
+      for (auto& g : graphs) CUDA_CHECK(cudaGraphExecDestroy(g.second));
+      graphs.clear();
+      spec_drop_graphs();
+    },
+    [&](float value) { CUDA_CHECK(cudaMemcpy(glp_alpha, &value, sizeof(float), cudaMemcpyHostToDevice)); },
+    [&] {
+      float back = 0.f;
+      CUDA_CHECK(cudaMemcpy(&back, glp_alpha, sizeof(float), cudaMemcpyDeviceToHost));
+      return back;
+    });
+  *confirmed = glp.alpha;
+  *epoch = steer.epoch();
+  if (!ok) *why = "device read-back mismatch; recovery required";
+  return ok;
 }
 
 Model::SteerInfo Model::steer_info() const {
@@ -304,10 +284,25 @@ Model::SteerInfo Model::steer_info() const {
   return i;
 }
 
+SteerConfig Model::steer_config() const { return d_->steer.config(); }
 uint64_t Model::steer_epoch() const { return d_->steer.epoch(); }
 
-bool Model::steer_set(float alpha, uint64_t expect_epoch, float* confirmed, uint64_t* epoch, std::string* why) {
-  return d_->steer_set(alpha, expect_epoch, confirmed, epoch, why);
+bool Model::steer_read(float* confirmed, std::string* why) {
+  if (d_->n_steps != d_->n_done) { *why = "a step is in flight"; return false; }
+  d_->sync();
+  *confirmed = d_->glp.alpha;
+  if (!d_->glp.on) return true;  // no device scalar exists when steering is off
+  CUDA_CHECK(cudaMemcpy(confirmed, d_->glp_alpha, sizeof(float), cudaMemcpyDeviceToHost));
+  if (!d_->steer_device_confirmed || std::memcmp(confirmed, &d_->glp.alpha, sizeof(float))) {
+    *why = "device/host state unconfirmed; recovery required";
+    return false;
+  }
+  return true;
+}
+
+bool Model::steer_set(float alpha, uint64_t expect_epoch, uint64_t target_epoch, bool recovery,
+                      float* confirmed, uint64_t* epoch, std::string* why) {
+  return d_->steer_set(alpha, expect_epoch, target_epoch, recovery, confirmed, epoch, why);
 }
 
 void Model::Impl::dump(Sink* sink, int L, const char* name, int pos0, int R, const void* dev, size_t row_bytes) {

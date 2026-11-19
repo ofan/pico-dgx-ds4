@@ -81,6 +81,12 @@ struct DoneHeader {              // 56 bytes
 };
 ```
 
+The r2 steering status field distinguishes **success** (1), **safe refusal/confirmed recovery** (2),
+and **unsafe or unconfirmed failure** (0). Status 2 is still an error for the requested set, but may
+release the steering admission hold after all four rank confirmations agree. The frontend must not
+interpret arbitrary nonzero status as successful. Frame sizes and reserved fields are unchanged.
+Both binaries must be delivered together; mixed trial revisions are not supported.
+
 `STEER_STATE` is answered on the same connection, with `req_id` as the `STEER_SET`/`STEER_GET`
 carried it:
 
@@ -91,7 +97,7 @@ struct SteerStateHeader {        // 40 bytes
   float    alpha;                // the effective alpha
   uint32_t on;                   // 1: a direction file is loaded
   uint32_t n_ranks;              // 4
-  uint32_t ok;                   // 1: applied (or read) and confirmed on every rank
+  uint32_t ok;                   // 0: unsafe error; 1: success; 2: safe refusal/recovered failure
   uint32_t error_len;            // bytes of error text after the ranks
   uint32_t pad;                  // 0
 };

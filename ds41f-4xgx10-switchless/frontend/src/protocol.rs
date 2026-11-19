@@ -119,6 +119,7 @@ pub struct SteerState {
     pub alpha: f32,
     pub on: bool,
     pub ok: bool,
+    pub admission_safe: bool,
     pub ranks: Vec<SteerRank>,
     pub error: String,
 }
@@ -242,7 +243,7 @@ impl Frame {
             Frame::SteerState(st) => {
                 let mut w = W::new(T_STEER_STATE);
                 w.u64(st.req_id).u64(st.epoch).f32(st.alpha).u32(st.on as u32).u32(st.ranks.len() as u32);
-                w.u32(st.ok as u32).u32(st.error.len() as u32).u32(0);
+                w.u32(if st.ok { 1 } else if st.admission_safe { 2 } else { 0 }).u32(st.error.len() as u32).u32(0);
                 for r in &st.ranks {
                     w.u64(r.epoch).f32(r.alpha).u32(r.rank).u32(r.ok as u32);
                     let mut why = [0u8; 96];
@@ -354,7 +355,10 @@ impl Frame {
                 let alpha = r.f32()?;
                 let on = r.u32()? != 0;
                 let n_ranks = r.u32()? as usize;
-                let ok = r.u32()? != 0;
+                let status = r.u32()?;
+                if status > 2 { return Err("invalid STEER_STATE status".into()); }
+                let ok = status == 1;
+                let admission_safe = status != 0;
                 let error_len = r.u32()? as usize;
                 if r.u32()? != 0 { return Err("STEER_STATE reserved is not 0".into()); }
                 if n_ranks > 8 || error_len > 4096 { return Err("invalid STEER_STATE limits".into()); }
@@ -369,7 +373,7 @@ impl Frame {
                     ranks.push(SteerRank { rank, alpha: ralpha, epoch: repoch, ok: rok, why });
                 }
                 let error = String::from_utf8_lossy(r.bytes(error_len)?).into_owned();
-                Frame::SteerState(SteerState { req_id, epoch, alpha, on, ok, ranks, error })
+                Frame::SteerState(SteerState { req_id, epoch, alpha, on, ok, admission_safe, ranks, error })
             }
             T_HELLO_ENGINE => {
                 let version = r.u32()?;
@@ -524,6 +528,7 @@ mod tests {
             alpha: 1.0,
             on: true,
             ok: true,
+            admission_safe: true,
             ranks: (0..4)
                 .map(|r| SteerRank { rank: r, alpha: 1.0, epoch: 2, ok: true, why: String::new() })
                 .collect(),
@@ -540,6 +545,7 @@ mod tests {
             alpha: 0.75,
             on: true,
             ok: false,
+            admission_safe: false,
             ranks: (0..4)
                 .map(|r| SteerRank { rank: r, alpha: 0.75, epoch: 0, ok: r < 3, why: if r < 3 { String::new() } else { "a step is in flight".into() } })
                 .collect(),
@@ -547,6 +553,9 @@ mod tests {
         };
         let b = Frame::SteerState(st.clone()).encode();
         assert_eq!(Frame::decode(T_STEER_STATE, &b[8..], |_| 0).unwrap(), Frame::SteerState(st.clone()));
+        st.admission_safe = true;
+        let recovered = Frame::SteerState(st.clone()).encode();
+        assert_eq!(Frame::decode(T_STEER_STATE, &recovered[8..], |_| 0).unwrap(), Frame::SteerState(st.clone()));
         st.error.push('x');
         let b = Frame::SteerState(st).encode();
         assert!(Frame::decode(T_STEER_STATE, &b[8..], |_| 0).is_ok());

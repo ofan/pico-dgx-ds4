@@ -31,6 +31,7 @@
 
 #include "model/impl.h"
 #include "model/prefill.h"
+#include "model/state_records.h"
 
 namespace model::detail {
 
@@ -60,32 +61,7 @@ struct Pool {
 
 class SpillFile;
 
-struct Store {
-  struct Sess {
-    std::vector<uint8_t*> pages;    // compressed caches: page i holds positions [i, i + 1) * kPagePos
-    int saved = 0;                  // positions [0, saved) are in the pages
-    std::map<int, uint8_t*> snaps;  // window snapshots by position, the draft module's windows after them
-    uint8_t* end = nullptr;         // every layer's ring and the carries (and the draft module's windows)
-    int end_pos = -1;               // at this position
-    uint64_t used = 0;              // the clock when an operation last used the session
-    // spilled: the same blocks at offsets in the disk tier's file, none in the pool
-    bool disk = false;
-    std::vector<size_t> dpages;
-    std::map<int, size_t> dsnaps;
-    size_t dend = Pool::kNone;
-    uint64_t dseq = 0;  // its last write (reading it back waits for that)
-    bool kept = false;  // as an earlier run kept it, not read back since: a block that differs is fatal
-  };
-  // A session in a kept file's index: its blocks' offsets and their checksums as they went out.
-  struct Kept {
-    int h = 0, saved = 0, end_pos = -1;
-    uint64_t used = 0;
-    std::vector<std::pair<size_t, uint64_t>> pages;
-    std::map<int, std::pair<size_t, uint64_t>> snaps;
-    size_t dend = Pool::kNone;
-    uint64_t dend_sum = 0;
-  };
-  std::map<int, Sess> sess;
+struct Store : StateRecords {
   Pool pool;
   size_t bytes = 0;          // the pool's bytes in sessions' blocks
   std::unique_ptr<SpillFile> disk;  // the disk tier (none: evicted sessions are freed)
@@ -99,8 +75,8 @@ struct Store {
   uint64_t clock = 0;
   std::vector<int> pinned;   // the sessions the current command uses: never evicted during it
   std::vector<int> evicted;  // sessions evicted to make room, since rank 0's server last asked
-  Sess& use(int h) {         // session h (made if new), used now
-    Sess& s = sess[h];
+  Sess& use(int h, const SteerTag& current) {         // session h (made if new), used now
+    Sess& s = use_record(h, current);
     s.used = ++clock;
     return s;
   }

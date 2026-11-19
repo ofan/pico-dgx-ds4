@@ -1,11 +1,8 @@
-// Host-only tests of the runtime steering control (model/steer.h): the strict alpha parser, the
-// documented range, the configuration identity, and the epoch machine. No GPU, no CUDA, no model.
-//
-// What this proves: a set request is accepted or refused exactly as documented, an identical value is
-// a no-op that moves no epoch, every applied change moves the epoch once, and the configuration id
-// changes if and only if the effective configuration changes. What it cannot prove: that the engine
-// reads the value back off the device, that CUDA graphs are invalidated, or anything about throughput.
+// CPU checks for production steering validation, hashing, four-rank coordination, device transaction
+// and cache-record enforcement. Device/transport stand-ins are not GPU or physical SSD qualification.
 #include "model/steer.h"
+#include "model/state_records.h"
+#include <array>
 
 #include <cmath>
 #include <cstdio>
@@ -85,6 +82,7 @@ static void test_epochs() {
   check(s.id() != id0, "the id changed with the configuration");
   // returning to the earlier value is a new change, never a revival of epoch 0
   const uint64_t e2 = s.commit(0.75f);
+  check(s.id() != id0, "returning to old alpha cannot revive old cache identity");
   check(e2 == 2, "returning to 0.75 is epoch 2, not epoch 0");
   check(s.check(0.75f) == SteerCheck::kNoop && s.epoch() == 2, "and settable to itself again after that");
   // a second state does not see the first's epochs
@@ -98,12 +96,139 @@ static void test_off() {
   check(s.epoch() == 0, "a refused set moves no epoch");
 }
 
+// The actual production coordinator with fake rank/device transport, not a second implementation.
+struct FourRanks {
+  std::array<SteerState, 4> ranks;
+  int refuse_apply = -1, refuse_recovery = -1, writes = 0, clears = 0;
+  bool mismatch = false;
+  FourRanks() { for (auto& s : ranks) s = SteerState(cfg(true, .75f, 63, 9)); }
+  void transport(SteerOp op, float alpha, uint64_t expect, uint64_t target, SteerAck* all) {
+    for (int r = 0; r < 4; ++r) {
+      bool ok = true;
+      if (op != SteerOp::kRead) {
+        ok = op == SteerOp::kApply ? r != refuse_apply && ranks[r].epoch() == expect : r != refuse_recovery;
+        if (ok) { ranks[r].recover(alpha, target); ++writes; }
+      }
+      all[r] = {};
+      all[r].rank = r; all[r].ok = ok; all[r].alpha = ranks[r].config().alpha;
+      all[r].epoch = ranks[r].epoch(); all[r].config_id = ranks[r].id();
+      if (op == SteerOp::kRead && mismatch && r == 2) { all[r].alpha = 1.25f; all[r].ok = false; }
+    }
+  }
+  SteerResult run(SteerTransaction& tx, const float* alpha) {
+    return tx.run(ranks[0].config(), ranks[0].epoch(), alpha,
+      [&](SteerOp op, float a, uint64_t e, uint64_t t, SteerAck* out) { transport(op, a, e, t, out); },
+      [&] { ++clears; });
+  }
+};
+static void test_multirank() {
+  for (int failed = 0; failed < 4; ++failed) {
+    FourRanks f;
+    SteerTransaction tx;
+    float alpha = 1.f;
+    f.refuse_apply = failed;
+    auto result = f.run(tx, &alpha);
+    check(!result.ok && result.safe && !tx.blocked(), "partial transition is refused but recovered safely");
+    check(f.clears == 1, "failed partial transition clears retained state");
+    for (const auto& r : f.ranks)
+      check(r.config().alpha == .75f && r.epoch() == 2, "applied and refusing ranks share recovery epoch 2");
+  }
+  FourRanks f;
+  SteerTransaction tx;
+  float alpha = 1.f;
+  f.refuse_apply = 2; f.refuse_recovery = 3;
+  auto result = f.run(tx, &alpha);
+  check(!result.ok && !result.safe && tx.blocked() && f.clears == 1, "rollback failure clears state and fails closed");
+  f.refuse_apply = -1; f.refuse_recovery = -1;
+  result = f.run(tx, nullptr); // operator reconciliation, not an unrelated new transition
+  check(result.ok && result.safe && !tx.blocked() && f.clears == 2, "explicit recovery confirms convergence before reopening");
+  for (const auto& r : f.ranks) check(r.epoch() == 2 && r.config().alpha == .75f, "recovery target survives failed rollback");
+  const int writes = f.writes, clears = f.clears;
+  alpha = .75f;
+  result = f.run(tx, &alpha);
+  check(result.ok && result.safe && !result.changed && f.writes == writes && f.clears == clears,
+        "same-alpha verified success neither writes nor evicts");
+  alpha = 0.f;
+  result = f.run(tx, &alpha);
+  check(result.ok && result.changed && f.clears == clears + 1, "successful transition evicts exactly once");
+  alpha = 2.01f;
+  const int before = f.writes;
+  result = f.run(tx, &alpha);
+  check(!result.ok && result.safe && f.writes == before, "invalid value is refused before any rank write");
+  FourRanks g; SteerTransaction t;
+  g.mismatch = true;
+  result = g.run(t, nullptr);
+  check(!result.ok && result.safe && g.clears == 1, "GET detects device disagreement and recovers, rather than trusting rank zero");
+  FourRanks different; SteerTransaction dt;
+  different.ranks[2] = SteerState(cfg(true, .75f, 62, 9));
+  result = different.run(dt, nullptr);
+  check(!result.safe && dt.blocked(), "equal alpha/epoch cannot conceal a different layer/direction configuration");
+  FourRanks exhausted; SteerTransaction et;
+  for (auto& r : exhausted.ranks) r.recover(.75f, UINT64_MAX);
+  exhausted.mismatch = true;
+  result = exhausted.run(et, nullptr);
+  check(!result.safe && et.blocked() && exhausted.writes == 0, "epoch exhaustion never wraps or reuses an identity during recovery");
+}
+static void test_device_recovery() {
+  SteerState s(cfg(true, .75f, 63, 9));
+  float host = .75f, device = .75f;
+  bool confirmed = true;
+  int graphs = 2, invalidations = 0, writes = 0;
+  auto invalidate = [&] { graphs = 0; ++invalidations; };
+  auto write = [&](float a) { check(graphs == 0 && !confirmed, "graphs invalidated before device write"); device = a; ++writes; };
+  auto mismatch_read = [&] { return device + .25f; };
+  check(!steer_device_apply(s, host, confirmed, 1.f, 1, invalidate, write, mismatch_read), "device mismatch is not success");
+  check(!confirmed && host == 1.25f && s.config().alpha == host && s.epoch() == 1,
+        "mismatch updates host/epoch to observed value and marks unconfirmed");
+  // Even if the host looks like the desired rollback value, the device must be written again.
+  host = .75f; s.recover(host, 1);
+  check(steer_device_apply(s, host, confirmed, .75f, 2, invalidate, write, [&] { return device; }), "forced device recovery succeeds");
+  check(device == .75f && host == .75f && confirmed && writes == 2 && invalidations == 2 && s.epoch() == 2,
+        "host-equal recovery does not take a no-op shortcut");
+}
+static void test_store_enforcement() {
+  using model::detail::StateRecords;
+  StateRecords store;
+  SteerTag original{cfg(true, .75f, 63, 9), 0};
+  auto& ram = store.use_record(1, original);
+  ram.saved = 128;
+  auto& ssd = store.use_record(2, original);
+  ssd.disk = true; ssd.dpages = {65536}; ssd.dsnaps.emplace(64, 131072); ssd.dend = 196608;
+  check(store.find_current(1, original) && store.find_current(2, original), "RAM and SSD handles accepted with full identity");
+  for (int field = 0; field < 5; ++field) {
+    SteerTag changed = original;
+    switch (field) {
+      case 0: changed.config.on = false; break;
+      case 1: changed.config.alpha = 1.f; break;
+      case 2: changed.config.layers = 62; break;
+      case 3: changed.config.vector_id = 10; break;
+      default: changed.epoch = 2;
+    }
+    check(!store.find_current(1, changed) && !store.find_current(2, changed), "lookup refuses stale RAM and SSD identity");
+    for (int h : {1, 2}) {
+      bool refused = false;
+      try { store.require_current(h, changed); } catch (const std::runtime_error&) { refused = true; }
+      check(refused, "load/restore/unspill shared guard refuses stale record before access");
+      refused = false;
+      try { store.use_record(h, changed); } catch (const std::runtime_error&) { refused = true; }
+      check(refused, "write/fork acquisition cannot relabel stale offsets or snapshots");
+    }
+    StateRecords::Kept kept; kept.steering = original; kept.pages = {{65536, 17}};
+    check(!kept.steering.matches(changed), "kept-record identity includes every configuration field and epoch");
+  }
+  check(store.require_current(2, original).dpages[0] == 65536, "refusal preserves SSD ownership, never reassigns it");
+  check(steer_config_id(original.config, 0) != steer_config_id(original.config, 2), "A-B-A epoch is part of configuration hash");
+}
+
 int main() {
   test_parse();
   test_check();
   test_identity();
   test_epochs();
   test_off();
+  test_multirank();
+  test_device_recovery();
+  test_store_enforcement();
   if (g_fail) {
     std::fprintf(stderr, "steer_test: %d failure(s)\n", g_fail);
     return 1;

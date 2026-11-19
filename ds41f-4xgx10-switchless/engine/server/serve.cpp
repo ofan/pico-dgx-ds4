@@ -409,13 +409,14 @@ struct Session {
 // The server's index of a planned stop's kept sessions (keep(); keepfile.h: 0600 in a 0700 directory,
 // whole or not at all): a header, then each session: id, handle, restart ranges, LRU clock and time,
 // history, encoder-only snapshots.
-// 2: the index names the steering configuration its sessions' state was computed under (steer.h).
-constexpr char kSrvMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'S', '2'};
+// 3: the index names configuration-plus-epoch and explicitly stores the steering epoch.
+constexpr char kSrvMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'S', '3'};
 struct SrvHeader {
   char magic[8];
   uint64_t gen;  // the store's (state.cu): both indexes come from the same stop
   int64_t written;
   int32_t n_sess, next_h;
+  uint64_t steer_epoch;
   uint64_t steer_id;  // Model::steer_epoch's configuration id at the stop
   uint64_t clock;
   uint64_t body_bytes, body_hash;
@@ -559,7 +560,7 @@ class Server {
     } else if (!gen) {
       why = "the store did not reuse its files";
     } else if (f.size() < sizeof hd || std::memcmp(hd.magic, kSrvMagic, sizeof kSrvMagic) != 0 || hd.gen != gen ||
-               hd.body_bytes != f.size() - sizeof hd || hd.steer_id != m_.steer_info().config_id ||
+               hd.body_bytes != f.size() - sizeof hd || hd.steer_id != m_.steer_info().config_id || hd.steer_epoch != m_.steer_epoch() ||
                keepfile::fnv(f.data() + sizeof hd, hd.body_bytes) != hd.body_hash || hd.n_sess < 0) {
       why = "the index is not of the stop whose files the store reused";
     } else {
@@ -634,40 +635,28 @@ class Server {
   void steer(const Event& e) {
     fe::SteerStateHeader st{};
     st.req_id = e.steer_id;
-    std::string why;
-    SteerAck acks[4];
-    bool ok = false;
-    const model::Model::SteerInfo before = m_.steer_info();
-    if (!before.on) {
-      why = "steering is off (WEIGHTLESS_STEER_PATH is unset); an alpha alone does not enable it";
-      steer_readback(m_, ring_, acks);
-    } else if (!rot_.empty() || !flying_.empty()) {
-      why = "the engine still has " + std::to_string(flying_.size()) + " request(s) in flight; retry when idle";
-      steer_readback(m_, ring_, acks);
-    } else if (e.steer_get) {
-      steer_readback(m_, ring_, acks);
-      ok = acks[0].ok != 0;
-      if (!ok) why = acks[0].why;
+    model::SteerResult result;
+    if (!rot_.empty() || !flying_.empty() || !ready_.empty() || !wait_.empty() || !held_.empty()) {
+      result.why = "engine requests still queued or in flight; retry when idle";
+      // No state changed, but do not declare an unconfirmed recovery safe.
+      steer_readback(m_, ring_, result.ranks);
+      result.safe = !steering_.blocked() &&
+        model::steer_confirmed(result.ranks, m_.steer_config(), m_.steer_epoch());
     } else {
-      steer_broadcast(m_, ring_, e.steer_alpha, before.epoch, acks);
-      ok = steer_agreed(acks, &why);
-      if (!ok && !steer_same(acks, before.alpha)) {
-        // A rank refused or diverged: put every rank back on the value it had. The value is restored,
-        // not compared, so the expected epoch is kSteerAnyEpoch.
-        steer_broadcast(m_, ring_, before.alpha, model::kSteerAnyEpoch, acks);
-        if (!steer_agreed(acks, &why))
-          why += "; rollback to " + std::to_string((double)before.alpha) + " did not converge on every rank";
-      } else if (!ok && steer_same(acks, before.alpha)) {
-        why += " (nothing changed)";
-      }
-      if (ok) drop_retained_state();
+      result = steering_.run(m_.steer_config(), m_.steer_epoch(), e.steer_get ? nullptr : &e.steer_alpha,
+        [&](model::SteerOp op, float alpha, uint64_t epoch, uint64_t target, SteerAck* a) {
+          steer_broadcast(m_, ring_, op, alpha, epoch, target, a);
+        }, [&] { drop_retained_state(); });
     }
+    const bool ok = result.ok;
+    const auto& why = result.why;
+    const auto& acks = result.ranks;
     const model::Model::SteerInfo after = m_.steer_info();
     st.epoch = after.epoch;
     st.alpha = after.alpha;
     st.on = after.on ? 1 : 0;
     st.n_ranks = 4;
-    st.ok = ok ? 1 : 0;
+    st.ok = ok ? 1 : (result.safe ? 2 : 0);
     st.error_len = (uint32_t)why.size();
     st.pad = 0;
     fe::SteerRank ranks[4];
@@ -690,29 +679,7 @@ class Server {
                 (double)acks[2].alpha, (double)acks[3].alpha, why.empty() ? "" : "; ", why.c_str());
   }
 
-  static bool steer_same(const SteerAck a[4], float alpha) {
-    for (int r = 0; r < 4; ++r)
-      if (!a[r].ok || std::memcmp(&a[r].alpha, &alpha, sizeof alpha) != 0) return false;
-    return true;
-  }
-
-  // Every rank applied it, holds the same value, and is at the same epoch.
-  static bool steer_agreed(const SteerAck a[4], std::string* why) {
-    for (int r = 0; r < 4; ++r)
-      if (!a[r].ok) {
-        *why = std::string("rank ") + std::to_string(r) + ": " + (a[r].why[0] ? a[r].why : "refused");
-        return false;
-      }
-    for (int r = 1; r < 4; ++r) {
-      if (std::memcmp(&a[r].alpha, &a[0].alpha, sizeof(float)) != 0 || a[r].epoch != a[0].epoch) {
-        *why = "rank " + std::to_string(r) + " holds alpha " + std::to_string((double)a[r].alpha) + " at epoch " +
-               std::to_string((unsigned long long)a[r].epoch) + ", rank 0 " + std::to_string((double)a[0].alpha) +
-               " at " + std::to_string((unsigned long long)a[0].epoch);
-        return false;
-      }
-    }
-    return true;
-  }
+  model::SteerTransaction steering_;  // persistent fail-closed recovery target across operator commands
 
   // A new epoch: no cached state may be served, continued, forked or restored across it (steer.h). The
   // store's blocks go, every session handle with them; the front-end keeps its sessions' text and
@@ -799,6 +766,7 @@ class Server {
     std::memcpy(hd.magic, kSrvMagic, sizeof kSrvMagic);
     hd.gen = gen, hd.written = (int64_t)unix_now(), hd.n_sess = n, hd.next_h = next_h_, hd.clock = clock_;
     hd.steer_id = m_.steer_info().config_id;
+    hd.steer_epoch = m_.steer_epoch();
     hd.body_bytes = f.size() - sizeof hd;
     hd.body_hash = keepfile::fnv(f.data() + sizeof hd, hd.body_bytes);
     std::memcpy(f.data(), &hd, sizeof hd);
@@ -1005,6 +973,11 @@ class Server {
   // A submit: held while its session is in flight (a session's requests run one at a time); waiting while
   // no slot can be had (every slot's session in flight, and no time-slicing); else started.
   void admit(Request&& rq) {
+    if (steering_.blocked()) {
+      done(rq, fe::kError, 0, 0, now_s(), 0, "steering recovery unconfirmed; admission closed");
+      Io::forget(rq);
+      return;
+    }
     if (flying_.count(rq.h.session_id)) return held_.push_back(std::move(rq));
     const auto it = sess_.find(rq.h.session_id);
     const int need = need_clamped(rq);

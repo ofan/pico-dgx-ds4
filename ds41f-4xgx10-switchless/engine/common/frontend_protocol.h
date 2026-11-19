@@ -107,7 +107,7 @@ struct SteerStateHeader {
   float alpha;
   uint32_t on;         // 1: steering is on in the engine
   uint32_t n_ranks;    // 4
-  uint32_t ok;         // 1: applied (or read) and confirmed on every rank
+  uint32_t ok;         // 0: unsafe error, 1: success, 2: safe refusal (confirmed recovery)
   uint32_t error_len;  // bytes of error text after the ranks
   uint32_t pad;        // 0
 };

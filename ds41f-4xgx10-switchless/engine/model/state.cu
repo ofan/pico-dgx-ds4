@@ -157,14 +157,15 @@ Store& Model::Impl::store_of() {
 
 namespace {
 
-// 2: the header names the steering configuration the spilled state was computed under (steer.h).
-constexpr char kKeptMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'K', '2'};
+// 3: full per-record steering tags and an explicit header epoch (steer.h); reject older layouts.
+constexpr char kKeptMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'K', '3'};
 
 struct KeptHeader {
   char magic[8];
   uint64_t gen, run_id, file_bytes;
   int64_t written;  // unix time, seconds
   int32_t rank, n_sess;
+  uint64_t steer_epoch;
   uint64_t steer_id;  // the steering configuration (Model::steer.id()) the state was computed under
   uint64_t clock;                              // the store's
   uint64_t page_bytes, snap_bytes, end_bytes;  // its layout
@@ -194,7 +195,7 @@ uint64_t Model::Impl::state_kept_check(const std::string& base, uint64_t run_id,
   if (std::memcmp(hd.magic, kKeptMagic, sizeof kKeptMagic) != 0) return bad("not a kept index");
   if (hd.run_id != run_id) return bad("of another engine binary, weights or options");
   if (hd.rank != rank) return bad("of another rank");
-  if (hd.steer_id != steer.id()) return bad("spilled state computed under another steering configuration");
+  if (hd.steer_id != steer.id() || hd.steer_epoch != steer.epoch()) return bad("spilled state computed under another steering configuration");
   if (age > max_age_s || age < -600) return bad("written " + std::to_string((long long)age) + " s ago");
   if (hd.page_bytes != kPageBytes || hd.snap_bytes != snap_bytes(sp) || hd.end_bytes != end_bytes(sp))
     return bad("of another layout");
@@ -215,6 +216,12 @@ uint64_t Model::Impl::state_kept_check(const std::string& base, uint64_t run_id,
     k.h = r.get<int32_t>(), k.saved = r.get<int32_t>(), k.end_pos = r.get<int32_t>();
     const int np = r.get<int32_t>(), ns = r.get<int32_t>(), he = r.get<int32_t>();
     k.used = r.get<uint64_t>();
+    k.steering.config.on = r.get<uint32_t>() != 0;
+    k.steering.config.alpha = r.get<float>();
+    k.steering.config.layers = r.get<uint64_t>();
+    k.steering.config.vector_id = r.get<uint64_t>();
+    k.steering.epoch = r.get<uint64_t>();
+    if (!k.steering.matches({steer.config(), steer.epoch()})) return bad("session steering identity differs");
     if (!r.ok || k.h <= 0 || !hs.insert(k.h).second || np < 0 || np > max_pages || ns < 0 || ns > 4096 || (he != 0 && he != 1) ||
         k.saved < 0 || k.saved > np * kPagePos || k.end_pos < -1 || k.end_pos > opt.max_ctx)
       return bad("a bad session record");
@@ -275,7 +282,8 @@ void Model::Impl::state_disk(const std::string& base, size_t bytes, size_t stagi
     };
     s.clock = s.kept_clock;
     for (const Store::Kept& k : s.kept) {
-      Store::Sess& ss = s.sess[k.h];
+      if (!k.steering.matches({steer.config(), steer.epoch()})) die("state: stale kept steering identity");
+      Store::Sess& ss = s.use_record(k.h, k.steering);
       ss.disk = ss.kept = true;
       ss.saved = k.saved, ss.end_pos = k.end_pos, ss.used = k.used;
       for (const auto& [off, sum] : k.pages) take(off, kPageBytes, sum), ss.dpages.push_back(off);
@@ -307,11 +315,14 @@ void Model::Impl::state_keep(uint64_t gen) {
   using keepfile::put;
   int n = 0;
   for (const auto& [h, ss] : s.sess) {
-    if (!ss.disk) continue;
+    if (!ss.disk || !ss.steering.matches({steer.config(), steer.epoch()})) continue;
     ++n;
     put<int32_t>(f, h), put<int32_t>(f, ss.saved), put<int32_t>(f, ss.end_pos);
     put<int32_t>(f, (int32_t)ss.dpages.size()), put<int32_t>(f, (int32_t)ss.dsnaps.size());
     put<int32_t>(f, ss.dend != Pool::kNone), put<uint64_t>(f, ss.used);
+    put<uint32_t>(f, ss.steering.config.on), put<float>(f, ss.steering.config.alpha);
+    put<uint64_t>(f, ss.steering.config.layers), put<uint64_t>(f, ss.steering.config.vector_id);
+    put<uint64_t>(f, ss.steering.epoch);
     for (const size_t o : ss.dpages) put<uint64_t>(f, o), put<uint64_t>(f, *s.disk->sum(o, false));
     for (const auto& [pos, o] : ss.dsnaps)
       put<int32_t>(f, pos), put<int32_t>(f, 0), put<uint64_t>(f, o), put<uint64_t>(f, *s.disk->sum(o, false));
@@ -322,6 +333,7 @@ void Model::Impl::state_keep(uint64_t gen) {
   hd.gen = gen, hd.run_id = s.run_id, hd.file_bytes = s.disk->size(), hd.written = (int64_t)std::time(nullptr);
   hd.rank = rank, hd.n_sess = n, hd.clock = s.clock;
   hd.steer_id = steer.id();
+  hd.steer_epoch = steer.epoch();
   hd.page_bytes = kPageBytes, hd.snap_bytes = snap_bytes(sp), hd.end_bytes = end_bytes(sp);
   hd.body_bytes = f.size() - sizeof hd;
   hd.body_hash = keepfile::fnv(f.data() + sizeof hd, hd.body_bytes);
@@ -419,7 +431,7 @@ void Model::Impl::state_spill(int h) {
   Store& s = store_of();
   const auto it = s.sess.find(h);
   if (it == s.sess.end() || it->second.disk) return;
-  Store::Sess& ss = it->second;
+  Store::Sess& ss = s.require_current(h, {steer.config(), steer.epoch()});
   const bool sp = spec != nullptr;
   const double t0 = wall_s();
   std::vector<size_t> dp;
@@ -483,7 +495,7 @@ void Model::Impl::state_unspill(int h) {
   Store& s = store_of();
   const auto it = s.sess.find(h);
   if (it == s.sess.end() || !it->second.disk) return;
-  Store::Sess& ss = it->second;
+  Store::Sess& ss = s.require_current(h, {steer.config(), steer.epoch()});
   ss.used = ++s.clock;
   const bool sp = spec != nullptr;
   const double t0 = wall_s();
@@ -539,9 +551,9 @@ namespace {
 // session h (made if new) for an operation that needs its blocks: back from the disk tier first
 Store::Sess& use_blocks(Model::Impl& m, int h) {
   Store& s = m.store_of();
-  const auto it = s.sess.find(h);
-  if (it != s.sess.end() && it->second.disk) m.state_unspill(h);
-  return s.use(h);
+  Store::Sess& ss = s.use(h, {m.steer.config(), m.steer.epoch()});
+  if (ss.disk) m.state_unspill(h);
+  return ss;
 }
 
 }  // namespace
@@ -656,6 +668,7 @@ void Model::Impl::state_snap_spec(int h, int pos) {
   const Store& s = store_of();
   const auto it = s.sess.find(h);
   if (it == s.sess.end() || it->second.disk) return;
+  if (!s.find_current(h, {steer.config(), steer.epoch()})) die("state: stale snapshot steering identity");
   const auto b = it->second.snaps.find(pos);
   if (b != it->second.snaps.end()) spec_windows(*spec, b->second + kSnapBytes, pos - kSnapRows, pos, true, st);
 }
@@ -716,7 +729,7 @@ void Model::Impl::state_drop(int h, int from) {
   Store& s = store_of();
   const auto it = s.sess.find(h);
   if (it == s.sess.end()) return;
-  Store::Sess& ss = it->second;
+  Store::Sess& ss = s.require_current(h, {steer.config(), steer.epoch()});
   ss.used = ++s.clock;
   const bool sp = spec != nullptr;
   if (ss.disk) {  // the file's blocks
@@ -769,6 +782,8 @@ void Model::Impl::state_copy_snaps(int src, int dst, int upto) {
   Store& s = store_of();
   const auto it = s.sess.find(src);
   if (it == s.sess.end() || src == dst) return;
+  s.require_current(src, {steer.config(), steer.epoch()});
+  s.use_record(dst, {steer.config(), steer.epoch()});
   if (it->second.disk) {
     s.pinned.push_back(dst);
     state_unspill(src);
@@ -787,6 +802,7 @@ void Model::Impl::state_drop_snap(int h, int pos) {
   Store& s = store_of();
   const auto it = s.sess.find(h);
   if (it == s.sess.end()) return;
+  s.require_current(h, {steer.config(), steer.epoch()});
   it->second.used = ++s.clock;
   if (it->second.disk) {
     const auto i = it->second.dsnaps.find(pos);
@@ -843,7 +859,7 @@ Model::StateInfo Model::state_info(int h) const {
   StateInfo r;
   if (!d_->store_s) return r;
   const auto it = d_->store_s->sess.find(h);
-  if (it == d_->store_s->sess.end()) return r;
+  if (it == d_->store_s->sess.end() || !d_->store_s->find_current(h, {d_->steer.config(), d_->steer.epoch()})) return r;
   const Store::Sess& ss = it->second;
   const bool spec = d_->spec != nullptr;
   r.saved = ss.saved;
