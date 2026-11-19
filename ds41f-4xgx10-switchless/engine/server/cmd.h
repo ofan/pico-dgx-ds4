@@ -12,6 +12,7 @@
 #include "comm/ring.h"
 #include "model/model.h"
 #include "model/steer.h"
+#include "server/state_commands.h"
 
 namespace srv {
 
@@ -27,39 +28,19 @@ struct Watchdog {
   ~Watchdog();
 };
 
-// A session's state operation (model.h state_*), applied by every rank in order.
-enum : int32_t {
-  kStSave = 1,     // state_save(h, a, b)
-  kStSnapEnd,      // state_snap_end(h, a)
-  kStLoad,         // state_load(h, a)
-  kStRestore,      // state_restore(h, a)
-  kStRestoreEnd,   // state_restore_end(h)
-  kStDrop,         // state_drop(h, a)
-  kStFree,         // state_free(h)
-  kStCopySnaps,    // state_copy_snaps(h, a, b): h's snapshots at <= b into session a
-  kStDropSnap,     // state_drop_snap(h, a)
-  kStSnap,         // state_snap(h, a)
-  kStSpill,        // state_spill(h)
-  kStUnspill,      // state_unspill(h)
-  kStKeep,         // state_keep(gen): a planned stop's kept sessions (gen = a | b << 32)
-};
-struct StateOp {
-  int32_t op = 0, h = -1, a = 0, b = 0;
-};
 void apply_state(model::Model& m, const StateOp& o);
 
 // What rank 0 tells every rank to do next (Ring::allgather_host on the bootstrap sockets, ~0.1-2 ms:
 // once per request or chunk, never per decode step).
 constexpr int kMaxStop = 32;
 constexpr int kMaxSnaps = 8;
-constexpr int kMaxOps = 12;
 enum : int32_t {
   kCmdStop = 0,     // leave the command loop
   kCmdStep = 1,     // a golden-mode step (model::Ctl)
   kCmdDecode = 2,   // decode_loop
   kCmdTokens = 3,   // set_tokens: n tokens of positions pos0 .. follow as a payload
   kCmdPrefill = 4,  // a prefill chunk (run_prefill)
-  kCmdState = 5,    // nothing but the state operations (every command applies ops[0 .. n_ops) first)
+  // kCmdState (5) and kCmdEpochFree (23): state_commands.h
   kCmdRows = 6,     // a step of `rows` rows with explicit tokens, sampled with sp, then snaps[] from the ring
   kCmdBatch = 7,    // batch_loop: n sessions decoding together, their BatchEntry's follow as a payload
   // batch_tf_loop: n sessions' teacher-forced rows, `rows` of each per step (B4's checks and bench); the

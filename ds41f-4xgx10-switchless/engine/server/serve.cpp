@@ -621,12 +621,8 @@ class Server {
   // Every rank: c's state operations, then c (rank 0's part of c.op is the caller's). c carries the
   // sessions live in the slots, which the store keeps (pinned).
   void issue(Cmd& c) {
-    for (size_t s = 0; s < slot_.size(); ++s) {
-      const auto it = slot_[s] ? sess_.find(slot_[s]) : sess_.end();
-      c.live[s] = it == sess_.end() ? 0 : it->second.h;
-    }
-    bcast(ring_, c);
-    apply_ops(m_, c);
+    issue_state_command(c, sess_, slot_, [&](const Cmd& command) { bcast(ring_, command); },
+                        [&](const Cmd& command) { apply_ops(m_, command); });
   }
   // An operator steering set (docs/steering-control.md): one alpha for all traffic, applied at this step
   // boundary on all four ranks, with each rank's read-back in the answer. The operator's front-end has
@@ -685,25 +681,15 @@ class Server {
   // store's blocks go, every session handle with them; the front-end keeps its sessions' text and
   // re-prefills on the next turn, so a session is not lost, only its KV, which the old alpha computed.
   void drop_retained_state() {
-    std::vector<StateOp> v;
-    for (const int h : m_.state_sessions()) v.push_back({kStFree, h, 0, 0});
-    if (!v.empty()) state(v);
-    sess_.clear();
-    for (auto& s : slot_) s = 0;
-    later_.clear();
-    std::printf("serve: steering epoch moved: retained state dropped (%zu session(s) to re-prefill)\n", v.size());
+    const size_t dropped = clear_retained_state<Cmd>(m_, sess_, slot_, later_, [&](Cmd& c) { issue(c); });
+    std::printf("serve: steering epoch moved: retained state dropped (%zu session(s) to re-prefill)\n", dropped);
   }
 
-  // State operations on every rank, in commands of kMaxOps.
+  // State operations on every rank, in commands of kMaxOps (ordinary pin/spill scheduling).
   void state(const std::vector<StateOp>& v) {
-    for (size_t i = 0; i < v.size(); i += kMaxOps) {
-      Cmd c{};
-      c.op = kCmdState;
-      c.n_ops = (int)std::min<size_t>(kMaxOps, v.size() - i);
-      std::copy(v.begin() + i, v.begin() + i + c.n_ops, c.ops);
-      issue(c);
-    }
+    state_command_batches<Cmd>(v, kCmdState, [&](Cmd& c) { issue(c); });
   }
+
   // A planned stop (SIGTERM): the sessions kept for the next start (load_kept; docs/engine.md). The slots'
   // sessions' states go to the store; sessions unused for keep_age_s are freed; those in device memory
   // are spilled to the disk tier, the most recently used first, as far as keep_bytes goes (the rest

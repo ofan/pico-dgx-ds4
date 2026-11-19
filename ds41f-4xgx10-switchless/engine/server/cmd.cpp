@@ -73,19 +73,7 @@ void apply_state(model::Model& m, const StateOp& o) {
 }
 
 void apply_ops(model::Model& m, const Cmd& c) {
-  if (c.slot >= 0) m.use_slot(c.slot);
-  std::vector<int> pin;
-  for (int i = 0; i < c.n_ops; ++i) {
-    pin.push_back(c.ops[i].h);
-    if (c.ops[i].op == kStCopySnaps) pin.push_back(c.ops[i].a);
-  }
-  if (c.handle >= 0) pin.push_back(c.handle);
-  const std::vector<int> resident = pin;
-  for (const int32_t h : c.live)
-    if (h > 0) pin.push_back(h);
-  m.state_pin(pin);
-  spill_other_live_snapshots(m, resident, c.live);
-  for (int i = 0; i < c.n_ops; ++i) apply_state(m, c.ops[i]);
+  apply_state_command(m, c, [](model::Model& model, const StateOp& op) { apply_state(model, op); });
 }
 
 Cmd bcast(comm::Ring& ring, const Cmd& mine) {
@@ -826,7 +814,7 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
       steer_sync_all(m, ring, c.steer_alpha, c.steer_epoch, c.steer_target_epoch, rank, c.flags, all);
       if (!all[rank].ok)
         std::fprintf(stderr, "rank %d: steering set refused: %s\n", rank, all[rank].why);
-    } else if (c.op != kCmdState) {
+    } else if (c.op != kCmdState && c.op != kCmdEpochFree) {
       die("rank %d: unknown command %d", rank, c.op);
     }
   }

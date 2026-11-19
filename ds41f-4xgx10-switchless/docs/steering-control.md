@@ -102,8 +102,10 @@ rank from that rank's own read-back of the device.
    marked unconfirmed and cannot be mistaken for a safe host-equal no-op on rollback.
 4. The coordinator checks all four confirmations (rank identity, alpha, epoch and full configuration
    hash). It drops retained RAM and SSD state after an applied change, and also on every recovery
-   attempt, including an unsuccessful one. Recovery forcibly writes the old alpha on **all** ranks
-   with the same target epoch. Failed recovery retains that target for the next operator command.
+   attempt, including an unsuccessful one. Epoch teardown broadcasts free-only batches to every rank;
+   it never routes old records through ordinary live-snapshot spill/retain scheduling or current-tag
+   acquisition. Stale-tag guards on normal reads, writes and spills remain enforced. Recovery forcibly
+   writes the old alpha on **all** ranks with the same target epoch. Failed recovery retains that target for the next operator command.
 5. Rank 0 answers with the effective state and all four device read-backs. The frontend only reopens
    after a safe result with four agreeing ranks. A subsequent serialized `steer` read establishes the
    final outcome of an earlier timed-out command, or retries pending recovery. GET checks device
@@ -131,6 +133,11 @@ Verified on CPU, no GPU needed:
   CUDA-free production store records exercise handle/acquisition refusal on each stale configuration
   field and epoch, for RAM, SSD offsets and kept records. These are CPU transport/device stand-ins,
   not CUDA, RDMA or physical SSD integration tests.
+  The shared production clear/batch/issue/apply/spill pipeline is also tested with 13, 16 and 25
+  retained handles (SSD enabled, a later slot-live RAM record), successful applies and a refusal on
+  each rank, failed recovery/retry, no-op preservation and free-only command validation. An ordinary
+  scheduling control reproduces the stale handle-13 spill before any free. Command envelopes,
+  transport and allocation/I/O effects are CPU stand-ins; scheduling and tag guards are production code.
 - `frontend/src/protocol.rs`: frame layout/round-trip, reserved-field refusal and safe recovery refusal.
 - `frontend/src/gate.rs`: drain, concurrent-change refusal (the first future is polled), cancellation
   before dispatch, and unknown-outcome/failed-recovery admission holds. A safe bit alone cannot reopen
