@@ -2354,8 +2354,19 @@ while a text block that reads the same string does not.
   divergence from the publisher's encoding.py is `enccheck`'s `placeholder_in_text_*`,
   `placeholder_in_block_*` and `tool_placeholder_*` cases: the reference raises, this port renders the
   literal as text.
-- Prefix reuse: `SessionTable::plan` takes the prompt's structural spans, and a reused prefix is cut
-  only at a structural edge.
+- Ordinary BPE sees one contiguous stream between actual recognized added tokens. Renderer span
+  edges are not tokenization boundaries, so ordinary prompts retain checkpoint-tokenizer ID parity.
+- Prefix reuse compares both shared bytes and recognized added-token positions/IDs. Cached generated
+  IDs carry their own provenance; text that merely spells a marker cannot acquire its structural ID
+  from an earlier request. Reuse cuts only at actual added-token edges, not arbitrary span edges.
+- Image placeholder rendering recurses through tool-result blocks just as image collection does:
+  every collected image retains exactly one structural placeholder, including nested images.
+- Session tests require a checkpoint tokenizer and fail (rather than silently returning) when it is
+  unavailable. Set `DSFRONT_TEST_TOKENIZER=/path/to/tokenizer.json` before `cargo test --locked`.
+  The pinned public 1017 tokenizer is revision `1bae0e1088993b9b82de08f59de5be5a34e42170`, SHA256
+  `c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b`. No model weights are needed.
+  The saved-table fixture also needs `TMPDIR` in a private non-git runtime directory, because
+  persisted conversation tables are intentionally rejected anywhere inside a git tree.
 - Tests: `encoding::tests::special_token_literals_in_text_are_plain_text`,
   `real_image_block_still_yields_one_placeholder`, `masked_parallel_encoding_matches_the_single_pass`,
   `server::tests::special_token_literals_prepare_like_any_other_text`, and

@@ -213,6 +213,7 @@ pub struct Tokenizer {
     added_raw: Trie,
     added_norm: Trie,
     special: Vec<bool>,
+    added: Vec<bool>,
     token_ids: HashMap<String, u32>,
 }
 
@@ -269,11 +270,13 @@ impl Tokenizer {
             token_ids.insert(s.clone(), id);
         }
         let mut special = vec![false; max_id + 1];
+        let mut added = vec![false; max_id + 1];
         let mut added_raw = Trie::new();
         let mut added_norm = Trie::new();
         for t in &j.added_tokens {
             id_bytes[t.id as usize] = t.content.as_bytes().to_vec().into_boxed_slice();
             special[t.id as usize] = t.special;
+            added[t.id as usize] = true;
             token_ids.insert(t.content.clone(), t.id);
             if t.normalized {
                 added_norm.insert(t.content.as_bytes(), t.id);
@@ -296,7 +299,7 @@ impl Tokenizer {
             let iab = *j.model.vocab.get(&ab).ok_or_else(|| format!("merge result {ab:?} not in vocab"))?;
             merges.entry(pair_key(ia, ib)).or_insert((rank as u32, iab));
         }
-        Ok(Tokenizer { merges, byte_ids, id_bytes, added_raw, added_norm, special, token_ids })
+        Ok(Tokenizer { merges, byte_ids, id_bytes, added_raw, added_norm, special, added, token_ids })
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -309,6 +312,10 @@ impl Tokenizer {
 
     pub fn is_special(&self, id: u32) -> bool {
         self.special.get(id as usize).copied().unwrap_or(false)
+    }
+
+    pub fn is_added(&self, id: u32) -> bool {
+        self.added.get(id as usize).copied().unwrap_or(false)
     }
 
     pub fn token_bytes(&self, id: u32) -> &[u8] {
@@ -355,21 +362,51 @@ impl Tokenizer {
 
     /// `encode_masked` with a caller-owned cache, appending to `out`.
     pub fn encode_masked_with(&self, text: &str, structural: &[(usize, usize)], cache: &mut Cache, out: &mut Vec<u32>) {
-        let mut pos = 0usize;
-        for &(a, e) in structural {
-            let (a, e) = (a.min(text.len()), e.min(text.len()));
-            if a < pos || e <= a || !text.is_char_boundary(a) || !text.is_char_boundary(e) {
-                continue;
-            }
-            if a > pos {
-                self.encode_plain(&text[pos..a], cache, out);
-            }
-            self.encode_with(&text[a..e], cache, out);
+        let mut pos = 0;
+        // Only actual recognized added tokens cut the plain stream. Arbitrary renderer span
+        // edges must not create pretokenization/BPE boundaries (e.g. ".\n\n" or ">\n").
+        for (a, e, id) in self.added_spans_masked(text, structural) {
+            self.encode_plain(&text[pos..a], cache, out);
+            out.push(id);
             pos = e;
         }
-        if pos < text.len() {
-            self.encode_plain(&text[pos..], cache, out);
+        self.encode_plain(&text[pos..], cache, out);
+    }
+
+    /// Effective added-token provenance, in encoding order. Keep the raw-then-normalized
+    /// precedence of `encode_with`, but accept a match only when wholly inside template structure.
+    pub fn added_spans_masked(&self, text: &str, structural: &[(usize, usize)]) -> Vec<(usize, usize, u32)> {
+        let b = text.as_bytes();
+        let mut spans = Vec::new();
+        let allowed = |a: usize, e: usize| {
+            let k = structural.partition_point(|&(start, _)| start <= a);
+            k > 0 && e <= structural[k - 1].1
+        };
+        let scan = |trie: &Trie, start: usize, end: usize| {
+            let mut out = Vec::new();
+            let mut i = start;
+            while i < end {
+                if trie.first[b[i] as usize] {
+                    if let Some((e, id)) = trie.longest_at(&b[..end], i) {
+                        if allowed(i, e) {
+                            out.push((i, e, id));
+                            i = e;
+                            continue;
+                        }
+                    }
+                }
+                i += 1;
+            }
+            out
+        };
+        let mut pos = 0;
+        for (a, e, id) in scan(&self.added_raw, 0, b.len()) {
+            spans.extend(scan(&self.added_norm, pos, a));
+            spans.push((a, e, id));
+            pos = e;
         }
+        spans.extend(scan(&self.added_norm, pos, b.len()));
+        spans
     }
 
     /// `encode_parallel` for a masked prompt: an added token may only span a cut inside a

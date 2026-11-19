@@ -795,6 +795,36 @@ pub fn find_last_user_index(messages: &[Value], enc: Encoding) -> Result<Option<
     Ok(None)
 }
 
+/// Mirror `process_image_blocks` recursively: every collected image retains its structural
+/// placeholder, even inside nested tool results. Text that spells a placeholder stays plain.
+fn render_content_blocks(p: &mut Prompt, blocks: &[Value], in_tool_result: bool) -> Result<(), EncodeError> {
+    for (i, b) in blocks.iter().enumerate() {
+        if !b.is_object() {
+            return Err(err(if in_tool_result { "AttributeError: tool result block is not an object" } else { "AttributeError: content block is not an object" }));
+        }
+        if i > 0 { p.push_text("\n\n"); }
+        match get_str(b, "type") {
+            Some("text") => p.push_text(&match get(b, "text") {
+                None => String::new(),
+                Some(Value::String(s)) => s.clone(),
+                Some(_) => return Err(err("TypeError: text must be a string")),
+            }),
+            Some("image_placeholder") => p.push_struct(IMAGE_PLACEHOLDER),
+            Some("tool_result") => {
+                p.push_struct("<tool_result>");
+                let tc = get(b, "content").cloned().unwrap_or(json!(""));
+                match &tc {
+                    Value::Array(items) => render_content_blocks(p, items, true)?,
+                    other => p.push_text(&py_str(other)),
+                }
+                p.push_struct("</tool_result>");
+            }
+            _ => p.push_text(&format!("[Unsupported {}]", py_str(get(b, "type").unwrap_or(&Value::Null)))),
+        }
+    }
+    Ok(())
+}
+
 fn render_message(
     p: &mut Prompt,
     index: usize,
@@ -841,50 +871,7 @@ fn render_message(
             p.push_struct(USER_SP);
             if truthy(get(msg, "content_blocks")) {
                 let blocks = get(msg, "content_blocks").unwrap().as_array().ok_or_else(|| err("content_blocks must be a list"))?;
-                for (bi, b) in blocks.iter().enumerate() {
-                    if !b.is_object() {
-                        return Err(err("AttributeError: content block is not an object"));
-                    }
-                    if bi > 0 {
-                        p.push_text("\n\n");
-                    }
-                    match get_str(b, "type") {
-                        Some("text") => p.push_text(&match get(b, "text") {
-                            None => String::new(),
-                            Some(Value::String(s)) => s.clone(),
-                            Some(_) => return Err(err("TypeError: text must be a string")),
-                        }),
-                        Some("image_placeholder") => p.push_struct(IMAGE_PLACEHOLDER),
-                        Some("tool_result") => {
-                            let tc = get(b, "content").cloned().unwrap_or(json!(""));
-                            p.push_struct("<tool_result>");
-                            match &tc {
-                                Value::Array(items) => {
-                                    for (ti, it) in items.iter().enumerate() {
-                                        if !it.is_object() {
-                                            return Err(err("AttributeError: tool result block is not an object"));
-                                        }
-                                        if ti > 0 {
-                                            p.push_text("\n\n");
-                                        }
-                                        if get_str(it, "type") == Some("text") {
-                                            p.push_text(&match get(it, "text") {
-                                                None => String::new(),
-                                                Some(Value::String(s)) => s.clone(),
-                                                Some(_) => return Err(err("TypeError: text must be a string")),
-                                            });
-                                        } else {
-                                            p.push_text(&format!("[Unsupported {}]", py_str(get(it, "type").unwrap_or(&Value::Null))));
-                                        }
-                                    }
-                                }
-                                other => p.push_text(&py_str(other)),
-                            }
-                            p.push_struct("</tool_result>");
-                        }
-                        _ => p.push_text(&format!("[Unsupported {}]", py_str(get(b, "type").unwrap_or(&Value::Null)))),
-                    }
-                }
+                render_content_blocks(p, blocks, false)?;
             } else {
                 // `prompt += content or ""`: concatenation, so only a string will do.
                 match content {
@@ -1581,6 +1568,36 @@ mod tests {
         let structural_ph: Vec<&(usize, usize)> = p.structural.iter().filter(|&&(a, e)| &p.text[a..e] == IMAGE_PLACEHOLDER).collect();
         assert_eq!(structural_ph.len(), 1);
         assert_eq!(p.text.matches(IMAGE_PLACEHOLDER).count(), 2, "one from the image block, one typed in the text");
+    }
+
+    #[test]
+    fn nested_tool_result_images_keep_one_placeholder_each() {
+        let tok = mini_tokenizer();
+        let msgs = json!([{"role":"user","content":[
+            {"type":"tool_result","content":[
+                {"type":"text","text":IMAGE_PLACEHOLDER},
+                {"type":"image_url","image_url":{"url":"https://example.invalid/first.png"}},
+                {"type":"tool_result","content":[
+                    {"type":"text","text":format!("literal {IMAGE_PLACEHOLDER}")},
+                    {"type":"image","url":"https://example.invalid/second.png"}
+                ]}
+            ]}
+        ]}]);
+        for enc in [Encoding::V41, Encoding::V41_1017] {
+            let mut opts = EncodeOptions::new(ThinkingMode::Chat);
+            opts.encoding = enc;
+            let (p, images) = encode_messages(msgs.as_array().unwrap(), &opts).unwrap();
+            assert_eq!(images.len(), 2);
+            assert_eq!(images[0]["url"], "https://example.invalid/first.png");
+            assert_eq!(images[1]["url"], "https://example.invalid/second.png");
+            assert!(!p.text.contains("Unsupported"));
+            assert_eq!(p.text.matches("<tool_result>").count(), 2);
+            assert_eq!(p.text.matches("</tool_result>").count(), 2);
+            assert_eq!(p.text.matches(IMAGE_PLACEHOLDER).count(), 4);
+            let ids = tok.encode_masked(&p.text, &p.structural);
+            assert_eq!(ids.iter().filter(|&&id| id == tok.token_id(IMAGE_PLACEHOLDER).unwrap()).count(), images.len());
+            assert_eq!(tok.decode(&ids), p.text);
+        }
     }
 
     /// A long prompt takes the parallel encoder; its cuts must not change what the mask protects.

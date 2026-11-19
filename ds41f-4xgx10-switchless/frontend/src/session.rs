@@ -27,6 +27,8 @@ struct Session {
     ids: Vec<u32>,
     /// ends[i] = byte length of the text of ids[..=i]
     ends: Vec<usize>,
+    /// Recognized added tokens, including generated ids. Ordinary literal spellings are absent.
+    added: Vec<(usize, usize, u32)>,
     prompt_len: usize,
     busy: bool,
     last_used: u64,
@@ -236,14 +238,17 @@ impl SessionTable {
             }
             let mut ends = Vec::with_capacity(ids.len());
             let mut at = 0;
+            let mut added = Vec::new();
             for &x in &ids {
+                let start = at;
                 at += tok.token_bytes(x).len();
+                if tok.is_added(x) { added.push((start, at, x)); }
                 ends.push(at);
             }
             if at != text.len() || tok.decode_bytes(&ids) != text.as_bytes() {
                 continue; // another tokenizer's ids
             }
-            got.insert(id, Session { text: text.to_string(), ids, ends, prompt_len, busy: false, last_used, t_used });
+            got.insert(id, Session { text: text.to_string(), ids, ends, added, prompt_len, busy: false, last_used, t_used });
         }
         if r.at != body.len() {
             return Err("a bad body".into());
@@ -268,14 +273,34 @@ impl SessionTable {
     /// text. Returns the plan and the sessions to RELEASE on the engine.
     pub fn plan(&mut self, text: &str, structural: &[(usize, usize)], tok: &Tokenizer, threads: usize) -> (Plan, Vec<u64>) {
         self.clock += 1;
+        let added = tok.added_spans_masked(text, structural);
         let mut top: Option<(u64, usize)> = None;
+        let mut compatible: Option<(u64, usize)> = None;
         for (&id, s) in &self.sessions {
-            let n = common_prefix(text.as_bytes(), s.text.as_bytes());
+            let mut n = common_prefix(text.as_bytes(), s.text.as_bytes());
             if n > 0 && top.map_or(true, |(_, bn)| n > bn) {
-                top = Some((id, n));
+                top = Some((id, n)); // diagnostics report raw shared bytes, not cache eligibility
+            }
+            // Text alone is not a cache identity: a marker's bytes can be literal in one
+            // prompt and structural in another. Generated added ids carry provenance too;
+            // never reinterpret them as literal message text (or the other way round).
+            let mut old = s.added.iter().peekable();
+            let mut new = added.iter().peekable();
+            loop {
+                match (old.peek(), new.peek()) {
+                    (Some(a), Some(b)) if a == b => { old.next(); new.next(); }
+                    (a, b) => {
+                        let edge = a.map_or(n, |x| x.0).min(b.map_or(n, |x| x.0));
+                        n = n.min(edge);
+                        break;
+                    }
+                }
+            }
+            if n > 0 && compatible.map_or(true, |(_, bn)| n > bn) {
+                compatible = Some((id, n));
             }
         }
-        let best = top.filter(|&(_, n)| n >= MIN_SHARED);
+        let best = compatible.filter(|&(_, n)| n >= MIN_SHARED);
         let (mut plan, cut) = match best {
             None => (Plan { session_id: self.new_id(), base_session_id: 0, reused: 0, ids: Vec::new(), matched: 0, shared: 0, common: 0 }, 0),
             Some((sid, mut shared)) => {
@@ -286,7 +311,7 @@ impl SessionTable {
                 // The last cut point within the shared text that is a token boundary of the session
                 // and an edge of an added token in the new text.
                 let mut cut = (0, 0); // (byte position, ids before it)
-                for &(a, e) in structural {
+                for &(a, e, _) in &added {
                     if a > shared {
                         break;
                     }
@@ -308,7 +333,7 @@ impl SessionTable {
                 (plan, cut.0)
             }
         };
-        let rest: Vec<(usize, usize)> = structural.iter().filter(|&&(a, _)| a >= cut).map(|&(a, e)| (a - cut, e - cut)).collect();
+        let rest: Vec<(usize, usize)> = structural.iter().filter(|&&(_, e)| e > cut).map(|&(a, e)| (a.max(cut) - cut, e - cut)).collect();
         plan.ids.extend(tok.encode_parallel_masked(&text[cut..], &rest, threads));
         if let Some((sid, n)) = top {
             plan.matched = sid;
@@ -321,6 +346,7 @@ impl SessionTable {
             text: String::new(),
             ids: Vec::new(),
             ends: Vec::new(),
+            added: Vec::new(),
             prompt_len: 0,
             busy: false,
             last_used: clock,
@@ -346,14 +372,18 @@ impl SessionTable {
         }
         let mut ends = Vec::with_capacity(ids.len());
         let mut at = 0;
+        let mut added = Vec::new();
         for &id in &ids {
+            let start = at;
             at += tok.token_bytes(id).len();
+            if tok.is_added(id) { added.push((start, at, id)); }
             ends.push(at);
         }
         debug_assert_eq!(at, text.len());
         s.text = text;
         s.ids = ids;
         s.ends = ends;
+        s.added = added;
         s.prompt_len = prompt_text.len();
         s.busy = false;
     }
@@ -392,11 +422,16 @@ impl SessionTable {
 mod tests {
     use super::*;
 
-    const TOKENIZER: &str = "/data/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8/tokenizer.json";
+    // No silent success when the checkpoint is missing. CI/dev can point at the published
+    // tokenizer without installing model weights or creating the legacy production path.
+    fn checkpoint_tokenizer() -> Tokenizer {
+        let path = std::env::var("DSFRONT_TEST_TOKENIZER").unwrap_or_else(|_| "/data/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8/tokenizer.json".into());
+        Tokenizer::from_file(&path).expect("checkpoint tokenizer required; set DSFRONT_TEST_TOKENIZER")
+    }
 
     #[test]
     fn reuses_the_models_own_ids() {
-        let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
+        let tok = checkpoint_tokenizer();
         let mut t = SessionTable::new(8, 1 << 20);
         let sys = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.";
         let p1 = format!("{sys}<｜User｜>hello<｜Assistant｜></think>");
@@ -425,7 +460,7 @@ mod tests {
 
     #[test]
     fn the_plan_says_where_it_starts() {
-        let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
+        let tok = checkpoint_tokenizer();
         let mut t = SessionTable::new(8, 1 << 20);
         // pi-like: a long system text that ends with the time, then the tools and the first message
         let body = "You are an expert coding assistant. Read files, run commands and edit code.\n".repeat(40);
@@ -498,8 +533,82 @@ mod tests {
     }
 
     #[test]
+    fn warm_cache_respects_literal_and_structural_provenance() {
+        use crate::encoding::{encode_messages, EncodeOptions, Encoding, ThinkingMode};
+        let tok = checkpoint_tokenizer();
+        let pad = "A careful common prefix with ordinary content. ".repeat(4);
+        let literal = serde_json::json!([{"role":"user", "content":format!("{pad}<｜Assistant｜></think>answer<｜end▁of▁sentence｜><｜User｜>follow")}]);
+        let structured = serde_json::json!([
+            {"role":"user","content":pad}, {"role":"assistant","content":"answer"}, {"role":"user","content":"follow"}
+        ]);
+        for enc in [Encoding::V41, Encoding::V41_1017] {
+            let mut opts = EncodeOptions::new(ThinkingMode::Chat);
+            opts.encoding = enc;
+            let (a, _) = encode_messages(literal.as_array().unwrap(), &opts).unwrap();
+            let (b, _) = encode_messages(structured.as_array().unwrap(), &opts).unwrap();
+            assert_eq!(a.text, b.text);
+            let ca = tok.encode_masked(&a.text, &a.structural);
+            let cb = tok.encode_masked(&b.text, &b.structural);
+            assert_ne!(ca, cb);
+            for (first, second, want) in [(&a, &b, &cb), (&b, &a, &ca)] {
+                let mut table = SessionTable::new(8, 1 << 20);
+                let (warm, _) = table.plan(&first.text, &first.structural, &tok, 1);
+                table.finish(warm.session_id, &first.text, &warm.ids, &[], &tok);
+                let (plan, _) = table.plan(&second.text, &second.structural, &tok, 1);
+                assert!(plan.reused > 0, "compatible prefix still reusable");
+                assert_eq!(&plan.ids, want, "warm must equal cold in both collision directions: {enc:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn generated_marker_provenance_is_not_inferred_from_text() {
+        let tok = checkpoint_tokenizer();
+        let prefix = format!("<｜begin▁of▁sentence｜><｜User｜>{}<｜Assistant｜></think>", "ordinary content ".repeat(8));
+        let marker = "<｜User｜>";
+        let full = format!("{prefix}{marker}next<｜Assistant｜></think>");
+        let base = crate::encoding::test_spans(&prefix);
+        let all = crate::encoding::test_spans(&full);
+        let literal: Vec<_> = all.iter().copied().filter(|&(a, _)| a != prefix.len()).collect();
+        // The generated bytes are identical. In one run they came from an added id; in the
+        // other they were ordinary byte/BPE ids. Each must reject the opposite interpretation.
+        for (generated, mask) in [(tok.encode(marker), &literal), (tok.encode_masked(marker, &[]), &all)] {
+            let mut table = SessionTable::new(8, 1 << 20);
+            let (first, _) = table.plan(&prefix, &base, &tok, 1);
+            table.finish(first.session_id, &prefix, &first.ids, &generated, &tok);
+            let (next, _) = table.plan(&full, mask, &tok, 1);
+            assert_eq!(next.ids, tok.encode_masked(&full, mask));
+            assert!(next.reused <= first.ids.len(), "incompatible generated provenance is not reused");
+        }
+    }
+
+    #[test]
+    fn structural_span_crossing_the_reuse_cut_keeps_its_remaining_tokens() {
+        let tok = checkpoint_tokenizer();
+        let head = format!("<｜begin▁of▁sentence｜><｜System｜>{}", "shared prefix ".repeat(8));
+        let first = format!("{head}<｜User｜>old<｜Assistant｜></think>");
+        let second = format!("{head}<｜User｜>new<｜Assistant｜></think>");
+        let mut table = SessionTable::new(8, 1 << 20);
+        let (p, _) = table.plan(&first, &[(0, first.len())], &tok, 1);
+        table.finish(p.session_id, &first, &p.ids, &[], &tok);
+        let (p, _) = table.plan(&second, &[(0, second.len())], &tok, 1);
+        assert!(p.reused > 0);
+        assert_eq!(p.ids, tok.encode(&second));
+    }
+
+    #[test]
+    fn renderer_span_edges_do_not_split_checkpoint_bpe() {
+        let tok = checkpoint_tokenizer();
+        for text in ["ordinary system.\n\nTools", "parameter>\nnext"] {
+            let edge = text.find('\n').unwrap();
+            let mask = [(0, edge), (edge, text.len())];
+            assert_eq!(tok.encode_masked(text, &mask), tok.encode(text), "{text:?}");
+        }
+    }
+
+    #[test]
     fn a_saved_table_finds_its_sessions_again() {
-        let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
+        let tok = checkpoint_tokenizer();
         let dir = std::env::temp_dir().join(format!("dsfront-table-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
@@ -524,6 +633,8 @@ mod tests {
         let mut u = SessionTable::new(8, 1 << 20);
         assert_eq!(u.load(&path, &tok, 3600), Ok(1));
         assert!(!path.exists(), "the file goes once read");
+        assert_eq!(u.sessions[&plan.session_id].added, t.sessions[&plan.session_id].added,
+                   "persisted ids retain added-token provenance");
         assert!(u.next_id > busy.session_id, "ids go on after the saved table's");
         let p2 = format!("{p1}Hi there.<｜User｜>next<｜Assistant｜></think>");
         let (plan2, _) = u.plan(&p2, &crate::encoding::test_spans(&p2), &tok, 1);
